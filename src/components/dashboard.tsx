@@ -206,7 +206,10 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
           <div ref={frame} className="relative h-full w-full bg-background">
             <PanelReport />
             <DashboardNotch frame={frame} edit={edit} />
-            <LiveArtifactRenderer.Content className="relative h-full overflow-y-auto p-4 sm:p-6">
+            {/* No top padding: the filter bar sticks to this scroller's content edge, so padding
+                above it would leave a strip where scrolled cards show over the bar. The
+                dashboard brings its own top space. */}
+            <LiveArtifactRenderer.Content className="relative h-full overflow-y-auto px-4 pb-4 sm:px-6 sm:pb-6">
               <LiveArtifactRenderer.Error>
                 <DashboardError />
               </LiveArtifactRenderer.Error>
