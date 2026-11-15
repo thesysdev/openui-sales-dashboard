@@ -812,7 +812,7 @@ const tools = {
   ),
 
   get_targets_vs_actuals: dataTool(
-    "Net sales against the approved monthly sales targets, for the whole business (scope business), each region, or each category. total: target, actual (net sales minus refunds processed) and attainment_pct over the whole range, for headline numbers. previous: the same for the months just before (null when they start before the data). totals: the same per scope over the whole range, for a bar or table per region or category. over_time: one row per month (period, target, actual, attainment_pct) summed over the scopes, for target against actual over time. rows: one per month and scope, for a month-by-scope grid. Targets are monthly, so the range counts whole months up to the last whole month, and they aren't set per brand or channel. Follows the range filter and the region or category filter: with one set, every scope, business included, gives that region's or category's numbers, so pass it into every call.",
+    "Net sales against the approved monthly sales targets, for the whole business (scope business), each region, or each category. total: target, actual (net sales minus refunds processed), gap (actual minus target), attainment_pct, net_sales (before refunds) and refunds over the whole range, for headline numbers. previous: the same for the months just before (null when they start before the data). totals: the same per scope over the whole range, for a bar or table per region or category. over_time: one row per month (period and the same figures) summed over the scopes, for target against actual over time. rows: one per month and scope, for a month-by-scope grid. over_time and rows reach back at least 6 months, so a short range still shows a trend. Targets are monthly, so the range counts whole months up to the last whole month, and they aren't set per brand or channel. Follows the range filter and the region or category filter: with one set, every scope, business included, gives that region's or category's numbers, so pass it into every call.",
     z.object({
       scope: z.enum(["business", "region", "category"]).default("business"),
       range,
@@ -821,24 +821,40 @@ const tools = {
     }),
     {
       scope: "region",
-      total: { target: 1_680_000, actual: 1_673_180.6, attainment_pct: 99.6 },
+      total: {
+        target: 1_680_000,
+        actual: 1_673_180.6,
+        gap: -6_819.4,
+        attainment_pct: 99.6,
+        net_sales: 1_812_400.9,
+        refunds: 139_220.3,
+      },
       previous: {
         target: 1_590_000,
         actual: 1_548_220.3,
+        gap: -41_779.7,
         attainment_pct: 97.4,
+        net_sales: 1_677_930.5,
+        refunds: 129_710.2,
       },
       totals: [
         {
           scope: "West",
           target: 960_000,
           actual: 921_300.4,
+          gap: -38_699.6,
           attainment_pct: 96.0,
+          net_sales: 998_120.7,
+          refunds: 76_820.3,
         },
         {
           scope: "South",
           target: 720_000,
           actual: 751_880.2,
+          gap: 31_880.2,
           attainment_pct: 104.4,
+          net_sales: 814_280.2,
+          refunds: 62_400,
         },
       ],
       over_time: [
@@ -846,13 +862,19 @@ const tools = {
           period: "2026-09",
           target: 540_000,
           actual: 529_310.4,
+          gap: -10_689.6,
           attainment_pct: 98.0,
+          net_sales: 573_420.1,
+          refunds: 44_109.7,
         },
         {
           period: "2026-10",
           target: 560_000,
           actual: 563_610.9,
+          gap: 3_610.9,
           attainment_pct: 100.6,
+          net_sales: 610_530.4,
+          refunds: 46_919.5,
         },
       ],
       rows: [
@@ -861,14 +883,20 @@ const tools = {
           scope: "West",
           target: 320_000,
           actual: 301_410.8,
+          gap: -18_589.2,
           attainment_pct: 94.2,
+          net_sales: 326_530.2,
+          refunds: 25_119.4,
         },
         {
           month: "2026-10",
           scope: "South",
           target: 240_000,
           actual: 262_200.1,
+          gap: 22_200.1,
           attainment_pct: 109.3,
+          net_sales: 284_000.2,
+          refunds: 21_800.1,
         },
       ],
     },
@@ -909,17 +937,49 @@ const tools = {
         .toISOString()
         .slice(0, 10);
       const comparable = beforeStart >= `${(await dataDays()).first.slice(0, 7)}-01`;
-      return run("targets", { scope, months, monthEnd, only }, async () => {
+      // A short range still shows a trend: over_time and rows reach back to 6 months. Dashboards
+      // made before `range` get the months they asked for.
+      const span = modern(args) ? Math.max(months, 6) : months;
+      const rangeStart = firstMonth.toISOString().slice(0, 7);
+      type Sum = { target: number; net_sales: number; refunds: number };
+      /** A target against what sold: actual is net sales minus refunds, gap is actual minus target. */
+      const figures = ({ target, net_sales, refunds }: Sum) => {
+        const actual = round2(net_sales - refunds);
+        return {
+          target: round2(target),
+          actual,
+          gap: round2(actual - target),
+          attainment_pct: pct(actual, target),
+          net_sales: round2(net_sales),
+          refunds: round2(refunds),
+        };
+      };
+      const add = (list: readonly Sum[]): Sum =>
+        list.reduce<Sum>(
+          (sum, row) => ({
+            target: sum.target + row.target,
+            net_sales: sum.net_sales + row.net_sales,
+            refunds: sum.refunds + row.refunds,
+          }),
+          { target: 0, net_sales: 0, refunds: 0 },
+        );
+      /** The rows of each month or scope, in the order the rows first name them. */
+      const groups = <Row extends Sum>(list: readonly Row[], key: (row: Row) => string) => {
+        const map = new Map<string, Row[]>();
+        for (const row of list) map.set(key(row), [...(map.get(key(row)) ?? []), row]);
+        return [...map];
+      };
+      return run("targets", { scope, months, span, monthEnd, only }, async () => {
         const dim = {
           business: "'ALL'",
           region: "o.shipping_region",
           category: "p.category",
         }[scope];
         const joins = scope === "category" ? PRODUCTS_JOIN : "";
-        // The first day of the earliest month: `months` whole months up to the month of `end`.
+        // The first day of the earliest month: `count` whole months up to the month of `end`.
         const since = "date_trunc('month', $1::date) - make_interval(months => $2 - 1)";
-        /** One row per month and scope, for the `months` months ending with `end`'s. */
-        const load = async (end: string) => {
+        /** One row per month and scope, for the `count` months ending with `end`'s. */
+        const load = async (end: string, count: number) => {
           const [targets, sales, refunds] = await Promise.all([
             query(
               `SELECT to_char(month_start, 'YYYY-MM') AS month, scope_id AS scope,
@@ -927,7 +987,7 @@ const tools = {
              FROM retail.sales_targets
              WHERE scope_type = $3 AND month_start >= ${since} AND month_start <= $1::date
              ORDER BY 1, 2`,
-              [end, months, scope],
+              [end, count, scope],
               signal,
             ),
             query(
@@ -936,7 +996,7 @@ const tools = {
              FROM ${ORDERS_JOIN}${joins}
              WHERE ${SALES_WHERE} AND o.placed_at >= ${since} AND o.placed_at < $1::date + 1
              GROUP BY 1, 2`,
-              [end, months],
+              [end, count],
               signal,
             ),
             query(
@@ -945,7 +1005,7 @@ const tools = {
              FROM ${RETURNS_JOIN}${joins}
              WHERE ${SALES_WHERE} AND r.processed_at >= ${since} AND r.processed_at < $1::date + 1
              GROUP BY 1, 2`,
-              [end, months],
+              [end, count],
               signal,
             ),
           ]);
@@ -959,62 +1019,45 @@ const tools = {
             .filter((row) => !only || String(row.scope).toLowerCase() === only)
             .map((row) => {
               const key = `${row.month}|${row.scope}`;
-              const actual = round2((booked.get(key) ?? 0) - (refunded.get(key) ?? 0));
               return {
                 month: row.month as string,
                 scope: row.scope as string,
-                target: row.target as number,
-                actual,
-                attainment_pct: pct(actual, row.target as number),
+                ...figures({
+                  target: row.target as number,
+                  net_sales: booked.get(key) ?? 0,
+                  refunds: refunded.get(key) ?? 0,
+                }),
               };
             });
         };
-        const [rows, earlier] = await Promise.all([
-          load(monthEnd),
-          comparable ? load(before) : null,
+        const [trend, earlier] = await Promise.all([
+          load(monthEnd, span),
+          comparable ? load(before, months) : null,
         ]);
-        const was = earlier && {
-          target: round2(earlier.reduce((sum, row) => sum + row.target, 0)),
-          actual: round2(earlier.reduce((sum, row) => sum + row.actual, 0)),
-        };
-        // Each scope over the whole range, in the order the rows first name them.
-        const sums = new Map<string, { target: number; actual: number }>();
-        for (const row of rows) {
-          const sum = sums.get(row.scope) ?? { target: 0, actual: 0 };
-          sum.target += row.target;
-          sum.actual += row.actual;
-          sums.set(row.scope, sum);
-        }
-        const totals = [...sums].map(([name, sum]) => ({
-          scope: name,
-          target: round2(sum.target),
-          actual: round2(sum.actual),
-          attainment_pct: pct(sum.actual, sum.target),
-        }));
-        const target = round2(totals.reduce((total, row) => total + row.target, 0));
-        const actual = round2(totals.reduce((total, row) => total + row.actual, 0));
-        // Each month over every scope.
-        const byMonth = new Map<string, { target: number; actual: number }>();
-        for (const row of rows) {
-          const sum = byMonth.get(row.month) ?? { target: 0, actual: 0 };
-          sum.target += row.target;
-          sum.actual += row.actual;
-          byMonth.set(row.month, sum);
-        }
+        // The headline and each scope count the range's own months; the trend may start earlier.
+        const inRange = trend.filter((row) => row.month >= rangeStart);
         return {
           scope,
-          total: { target, actual, attainment_pct: pct(actual, target) },
-          previous: was
-            ? { ...was, attainment_pct: pct(was.actual, was.target) }
-            : { target: null, actual: null, attainment_pct: null },
-          totals,
-          over_time: [...byMonth].map(([period, sum]) => ({
-            period,
-            target: round2(sum.target),
-            actual: round2(sum.actual),
-            attainment_pct: pct(sum.actual, sum.target),
+          total: figures(add(inRange)),
+          previous: earlier
+            ? figures(add(earlier))
+            : {
+                target: null,
+                actual: null,
+                gap: null,
+                attainment_pct: null,
+                net_sales: null,
+                refunds: null,
+              },
+          totals: groups(inRange, (row) => row.scope).map(([name, list]) => ({
+            scope: name,
+            ...figures(add(list)),
           })),
-          rows,
+          over_time: groups(trend, (row) => row.month).map(([period, list]) => ({
+            period,
+            ...figures(add(list)),
+          })),
+          rows: trend,
         };
       });
     },

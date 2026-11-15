@@ -3,7 +3,7 @@
 import { defineToolkit } from "@assistant-ui/react";
 import { z } from "zod";
 import { DashboardCard } from "../components/dashboard";
-import { FILTER_NAMES, RANGE_VALUES } from "./data/filters";
+import { RANGE_VALUES } from "./data/filters";
 import { dashboardBrief } from "./filter-bar";
 import { dashboards, userId } from "./openui";
 
@@ -25,7 +25,7 @@ export default defineToolkit({
         .string()
         .min(1)
         .describe(
-          "What to show, in this order: 3 to 5 headline numbers; a chart comparing what the user split by; a chart of how it moved over time; a detail table. Say which data each shows. Leave out the period and the filters: `range` and `filters` set them, and every part of the dashboard follows them.",
+          "What to show, in this order: 3 to 6 headline numbers; a chart comparing what the user split by; a chart of how it moved over time; a detail table; then whatever else in the data explains them, such as what is behind a shortfall. Say which data each shows. Leave out the period: `range` sets it, and every part of the dashboard follows it.",
         ),
       range: z
         .enum(RANGE_VALUES)
@@ -33,20 +33,13 @@ export default defineToolkit({
         .describe(
           'The period the dashboard opens on, which the reader can change: "1m" last month, "3m" last quarter, "12m" last year, "lifetime" everything. Default "3m".',
         ),
-      filters: z
-        .array(z.enum(FILTER_NAMES))
-        .max(3)
-        .optional()
-        .describe(
-          "What the reader can filter by, each starting at all: the dimension the user split by, then any other that helps.",
-        ),
     }),
-    // The filter bar is written here, not by the model: the same date presets and option values
-    // on every dashboard, the ones the data tools read, passed into every query. So are the parts
-    // every dashboard has, whatever the model's description leaves out.
-    execute: ({ title, prompt, range = "3m", filters = [] }, { abortSignal }) =>
+    // The builder picks the filters, by what the dashboard shows. Added here are what they have
+    // to do (start on the period asked for, be followed by every query) and the parts every
+    // dashboard has, whatever the model's description leaves out.
+    execute: ({ title, prompt, range = "3m" }, { abortSignal }) =>
       dashboards.create(
-        { title, prompt: `${prompt}\n\n${dashboardBrief(range, [...new Set(filters)])}` },
+        { title, prompt: `${prompt}\n\n${dashboardBrief(range)}` },
         { userId: userId() },
         { signal: abortSignal },
       ),
