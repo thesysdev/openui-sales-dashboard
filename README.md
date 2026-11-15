@@ -85,7 +85,7 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 | `src/lib/visitor.ts`, `src/proxy.ts` | Each browser's anonymous visitor id, which owns its dashboards |
 | `src/lib/base-path.ts` | The base path, for hand-written URLs |
 | `src/lib/toolkit.tsx` | `create_dashboard` and `edit_dashboard`: schema, `execute`, `render` |
-| `src/lib/filter-bar.ts`, `examples.ts` | What `create_dashboard` asks of every dashboard (its layout, and filters that every query follows; the builder picks which), and the example dashboards the builder learns from |
+| `src/lib/filter-bar.ts`, `examples.ts` | What `create_dashboard` asks of every dashboard (filters that every query follows; the builder picks which, and the charts and layout), and short examples of how the data is wired |
 | `src/lib/prompt.ts` | Chat instructions and the data dashboards can show |
 | `src/app/page.tsx`, `src/components/home-sentence.tsx` | Home page and the sentence builder |
 | `src/components/app.tsx` | Runtime, providers, and the three-pane layout |

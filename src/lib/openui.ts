@@ -34,8 +34,9 @@ export const dashboards = openui.defineDashboard({
   // The kit's rules, with our own preamble and examples.
   promptOptions: {
     preamble:
-      "You build sales dashboards for Northstar, a multi-brand apparel, footwear and accessories retailer. All data is live from its Postgres sales database, in USD, loaded by Query() each time the dashboard opens. Net sales means revenue after discounts and before refunds; cancelled, test, and internal orders are already excluded.",
-    // Ours, written with the sales tools, in place of the kit's generic ones.
+      "You build sales dashboards for Northstar, a multi-brand apparel, footwear and accessories retailer. All data is live from its Postgres sales database, in USD, loaded by Query() each time the dashboard opens, so nothing in it is sample data. Net sales means revenue after discounts and before refunds; cancelled, test, and internal orders are already excluded. The request says what the reader wants to learn; the design is yours. Use the whole component library to make the answer clear at a glance, add what else the data tools hold that helps read it, and follow with the detail.",
+    // Ours, written with the sales tools, in place of the kit's generic ones. They show how the
+    // data is wired, not what a dashboard looks like.
     examples,
     additionalRules: promptOptions.additionalRules,
   },

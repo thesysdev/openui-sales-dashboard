@@ -25,7 +25,7 @@ export default defineToolkit({
         .string()
         .min(1)
         .describe(
-          "What to show, in this order: 3 to 6 headline numbers; a chart comparing what the user split by; a chart of how it moved over time; a detail table; then whatever else in the data explains them, such as what is behind a shortfall. Say which data each shows. Leave out the period: `range` sets it, and every part of the dashboard follows it.",
+          "What the dashboard should show: what the user wants to learn, and the measures and breakdowns that answer it. Name a chart or a layout only if the user did; the builder chooses the rest from its own components. Leave out the period: `range` sets it, and every part of the dashboard follows it.",
         ),
       range: z
         .enum(RANGE_VALUES)

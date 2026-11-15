@@ -26,14 +26,12 @@ export const filterArgs = (names: readonly FilterName[]) =>
   ["range: $range", ...names.map((name) => `${name}: $${name}`)].join(", ");
 
 /**
- * What create_dashboard adds to its prompt: the parts every dashboard has, so a request that
- * names only a table still opens on headline numbers and shows the split and the trend, and
- * what its filters have to do. The builder picks the filters, by what the dashboard shows.
+ * What create_dashboard adds to its prompt: what the filters have to do, and nothing about how
+ * the dashboard looks. Which filters, which charts and what layout are the builder's choice.
  */
 export function dashboardBrief(start: RangeValue): string {
   return [
-    "Layout, top to bottom. Where the description above leaves a part out, add it from the data tools: a lead Kpis strip of 3 to 6 headline numbers, with previous values where a tool gives them; a chart comparing what the dashboard is split by; a chart over time; a detail table carrying the other measures the tool returns. Every number is live from the sales database, so nothing is labelled sample data.",
     `Filters. Choose them for what this dashboard shows. The date filter starts at $range = ${JSON.stringify(start)}. Add the others a reader of these cards would reach for, out of the arguments the tools take: a region, category, brand or channel to narrow by, or a choice such as what to rank by. One that changes the whole dashboard goes in the FilterBar, one that changes a single card in that Card's controls. Options are the values the tool lists.`,
-    "Every Query passes range: $range and each other filter's variable its tool takes. No Query sets its own period, and no title, subtitle or hint names one: the date filter does.",
+    "Every Query passes range: $range and each other filter's variable its tool takes. Leave out a filter or a card's switch that no Query or chart would read. No Query sets its own period, and no title, subtitle or hint names one: the date filter does.",
   ].join("\n");
 }
