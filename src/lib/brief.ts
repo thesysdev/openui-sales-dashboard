@@ -52,10 +52,13 @@ const written = ({ name, value }: Pick<Planned, "name" | "value">) => [
   dimensionFilter(name, FILTERS[name].values.length <= 4 ? "ChipFilter" : "SelectFilter"),
 ];
 
-/** What a card says when it can't follow a filter: the filter's label for all, in its subtitle. */
+/**
+ * What a card or a Kpi says when it can't follow a filter: the filter's label for all, in the
+ * card's subtitle or the Kpi's hint. The check (check.ts) looks for it in both.
+ */
 const saysAll = (argument: string) =>
-  argument in FILTERS
-    ? ` and says ${JSON.stringify(FILTERS[argument as FilterName].all)} in its subtitle`
+  Object.hasOwn(FILTERS, argument)
+    ? ` and says ${JSON.stringify(FILTERS[argument as FilterName].all)} in its subtitle (a Kpi, in its hint)`
     : "";
 
 /**
@@ -71,13 +74,13 @@ function wiring(filters: readonly Wired[]): string[] {
     const tools = without(filter.argument);
     if (tools.length) {
       lines.push(
-        `Every Query whose tool takes ${filter.argument} passes ${pass(filter)}. ${tools.join(", ")} can't take it: a card that reads only ${tools.length > 1 ? "those tools" : "that tool"} stays as it is${saysAll(filter.argument)}. If no Query on the dashboard takes it, leave the filter out.`,
+        `Every Query whose tool takes ${filter.argument} passes ${pass(filter)}. ${tools.join(", ")} can't take it: a card or Kpi that reads only ${tools.length > 1 ? "those tools" : "that tool"} stays as it is${saysAll(filter.argument)}. If no Query on the dashboard takes it, leave the filter out.`,
       );
     }
     for (const [tool, { ignores }] of Object.entries(dataset.tools)) {
       for (const [other, values] of Object.entries(ignores?.[filter.argument] ?? {})) {
         exceptions.push(
-          `A ${tool} call with ${other} ${values.map((value) => JSON.stringify(value)).join(" or ")} doesn't follow ${filter.argument}: leave ${filter.argument} out of it, and a card that reads only such calls stays as it is${saysAll(filter.argument)}.`,
+          `A ${tool} call with ${other} ${values.map((value) => JSON.stringify(value)).join(" or ")} doesn't follow ${filter.argument}: leave ${filter.argument} out of it, and a card or Kpi that reads only such calls stays as it is${saysAll(filter.argument)}.`,
         );
       }
     }
@@ -160,7 +163,7 @@ export function filterChange(
     const queries = (now?.queries ?? []).filter(({ tool }) => tools.includes(tool));
     return queries.length
       ? [
-          `Here ${list(queries.map((query) => query.name))} can't take ${name}: add ${JSON.stringify(FILTERS[name].all)} to the subtitle of every Card that reads nothing else.`,
+          `Here ${list(queries.map((query) => query.name))} can't take ${name}: add ${JSON.stringify(FILTERS[name].all)} to the subtitle of every Card, and the hint of every Kpi, that reads nothing else.`,
         ]
       : [];
   });

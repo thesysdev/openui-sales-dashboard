@@ -1,4 +1,5 @@
 import { parseExpression, parseMessage, split, tokenize, type ASTNode } from "@openuidev/lang-core";
+import spec from "../generated/spec.json";
 import { dataTools } from "./data";
 import { FILTERS } from "./data/filters";
 
@@ -14,11 +15,40 @@ import { FILTERS } from "./data/filters";
  */
 export type Ignores = Record<string, Record<string, readonly string[]>>;
 
-/** What the check knows of the data: each tool's arguments, and each filter's label for all. */
+/**
+ * What the check knows of the data: each tool's arguments and a sample of what it returns, each
+ * filter's label for all, and for each of the library's components which of its arguments, in
+ * order, take a column (a list of plain values).
+ */
 export type Dataset = {
-  tools: Record<string, { takes: readonly string[]; ignores?: Ignores }>;
+  tools: Record<string, { takes: readonly string[]; ignores?: Ignores; returns?: unknown }>;
   filters: Record<string, { all: string }>;
+  components?: Record<string, readonly boolean[]>;
 };
+
+type Schema = {
+  type?: unknown;
+  items?: Schema;
+  anyOf?: Schema[];
+  properties?: Record<string, Schema>;
+};
+
+/** Whether a list's items are plain values: text, numbers or nothing, not objects or components. */
+const plainItems = (items: Schema | undefined): boolean => {
+  if (!items) return false;
+  if (items.anyOf) return items.anyOf.every((option) => plainItems(option));
+  const types = Array.isArray(items.type) ? items.type : [items.type];
+  return types.every((type) => typeof type === "string" && type !== "object");
+};
+
+/** Each component's arguments in the order they are written, true where one takes a column. */
+const columnArguments = (definitions: Record<string, Schema>) =>
+  Object.fromEntries(
+    Object.entries(definitions).map(([name, { properties = {} }]) => [
+      name,
+      Object.values(properties).map(({ type, items }) => type === "array" && plainItems(items)),
+    ]),
+  );
 
 /** The dataset in ./data. */
 export const dataset: Dataset = {
@@ -28,19 +58,23 @@ export const dataset: Dataset = {
       {
         takes: Object.keys((tool.parameters as { properties?: object }).properties ?? {}),
         ignores: (tool as { ignores?: Ignores }).ignores,
+        returns: tool.output,
       },
     ]),
   ),
   filters: FILTERS,
+  components: columnArguments(spec.schema.$defs as unknown as Record<string, Schema>),
 };
 
 export type Problem = {
   /**
    * unpassed: a Query leaves out a filter its tool takes. fixed: a Query writes its own value
    * for an argument a filter sets. unread: nothing shown reads a control's variable. unbound: a
-   * control has no variable. unsaid: a card can't follow a filter and doesn't say so.
+   * control has no variable. unsaid: a card or Kpi can't follow a filter and doesn't say so.
+   * rows: a component is given a list of rows whole where it takes one column, which draws
+   * nothing readable.
    */
-  kind: "unpassed" | "fixed" | "unread" | "unbound" | "unsaid";
+  kind: "unpassed" | "fixed" | "unread" | "unbound" | "unsaid" | "rows";
   /** What to change, as one sentence the builder can act on. */
   fix: string;
 };
@@ -48,7 +82,7 @@ export type Problem = {
 /** The edit that repairs a dashboard: one line per problem, and nothing else changes. */
 export const repairPrompt = (problems: readonly Problem[]) =>
   [
-    "Repair this dashboard's filters. Make exactly these changes and keep everything else as it is:",
+    "Repair this dashboard. Make exactly these changes and keep everything else as it is:",
     ...problems.map((problem) => `- ${problem.fix}`),
   ].join("\n");
 
@@ -60,6 +94,9 @@ const QUERY = "Query";
 const CARD_CONTENT = 1;
 const CARD_SUBTITLE = 3;
 const CARD_CONTROLS = 4;
+/** Kpi(label, value, format, previous, goodWhen, hint, chart, tone). */
+const KPI = "Kpi";
+const KPI_HINT = 5;
 /** The one control that works without a variable. */
 const NEEDS_NO_VARIABLE = "CompareToggle";
 /** The controls that set a date. */
@@ -165,6 +202,7 @@ function parse(program: string) {
 
   // What is drawn: everything the root reaches. The first FilterBar is the one shown.
   const cards: Comp[] = [];
+  const kpis: Comp[] = [];
   let bar: Comp | undefined;
   const seen = new Set<string>();
   const find = (node: ASTNode | undefined) => {
@@ -176,11 +214,13 @@ function parse(program: string) {
     }
     if (isComp(node, BAR)) bar ??= node;
     if (isComp(node, CARD)) cards.push(node);
+    if (isComp(node, KPI)) kpis.push(node);
     children(node).forEach(find);
   };
   const root: ASTNode = { k: "Ref", n: all.has("root") ? "root" : ([...all.keys()][0] ?? "") };
   find(root);
-  return { all, resolve, call, controls, passedAs, cards, bar: bar as Comp | undefined, root };
+  const shown = bar as Comp | undefined;
+  return { all, resolve, call, controls, passedAs, cards, kpis, bar: shown, root };
 }
 
 /** What a change to a dashboard has to know of it. */
@@ -222,7 +262,7 @@ export function readDashboard(program: string, data: Dataset = dataset): Current
 
 /** The problems in a dashboard's program: none when every control changes what it sits over. */
 export function checkProgram(program: string, data: Dataset = dataset): Problem[] {
-  const { all, resolve, call, controls, passedAs, cards, bar, root } = parse(program);
+  const { all, resolve, call, controls, passedAs, cards, kpis, bar, root } = parse(program);
   /** A data tool by its own name: a Query may name anything, a script included. */
   const toolOf = (name: string) => (Object.hasOwn(data.tools, name) ? data.tools[name] : undefined);
 
@@ -359,20 +399,94 @@ export function checkProgram(program: string, data: Dataset = dataset): Problem[
       continue;
     }
 
-    // A card none of whose Queries can follow a filter says so, with the filter's label for all.
+    // What sits under a filter and can't follow it says so, with the filter's label for all: a
+    // Card in its subtitle, a Kpi in its hint. A Query on a script is one that can't, unless it
+    // is passed the filter.
     const label = [...feeds, named].map((name) => data.filters[name]?.all).find(Boolean);
     if (!label) continue;
-    for (const card of cards) {
-      const content = reads(card.args[CARD_CONTENT]);
+    const under = [
+      ...cards.map((card) => ({
+        what: `card ${title(card)}`,
+        shows: card.args[CARD_CONTENT],
+        says: card.args[CARD_SUBTITLE],
+        place: "subtitle",
+      })),
+      ...kpis.map((kpi) => ({
+        what: `Kpi ${title(kpi)}`,
+        shows: kpi as ASTNode,
+        says: kpi.args[KPI_HINT],
+        place: "hint",
+      })),
+    ];
+    for (const { what, shows, says, place } of under) {
+      const content = reads(shows);
       if (!content.queries.size || content.variables.has(variable)) continue;
-      const read = queries.filter((query) => content.queries.has(query.name));
-      if (read.length < content.queries.size || read.some(follows)) continue;
-      if (words(card.args[CARD_SUBTITLE]).toLowerCase().includes(label.toLowerCase())) continue;
+      // One of its Queries could follow and doesn't: that is reported above, as unpassed.
+      if (queries.some((query) => content.queries.has(query.name) && follows(query))) continue;
+      if (words(says).toLowerCase().includes(label.toLowerCase())) continue;
       problems.push({
         kind: "unsaid",
-        fix: `The card ${title(card)} can't follow the ${variable} filter: say ${JSON.stringify(label)} in its subtitle.`,
+        fix: `The ${what} can't follow the ${variable} filter: say ${JSON.stringify(label)} in its ${place}.`,
       });
     }
   }
-  return problems;
+
+  // A component takes columns: a list of rows passed whole draws nothing readable. What a Query
+  // returns is known by its tool's sample, read down the same path the program writes.
+  const sample = (node: ASTNode | undefined, depth = 0): unknown => {
+    if (!node || depth > 8) return undefined;
+    if (node.k === "Ref") {
+      const query = call(node.n);
+      if (query) return toolOf(query.tool)?.returns;
+      const statement = all.get(node.n);
+      return statement && !isComp(statement, QUERY) ? sample(statement, depth + 1) : undefined;
+    }
+    if (node.k !== "Member") return undefined;
+    const from = sample(node.obj, depth + 1);
+    // A field read off a list is that field of every row.
+    if (Array.isArray(from)) {
+      const first: unknown = from[0];
+      return first && typeof first === "object"
+        ? [(first as Record<string, unknown>)[node.field]]
+        : undefined;
+    }
+    return from && typeof from === "object"
+      ? (from as Record<string, unknown>)[node.field]
+      : undefined;
+  };
+  const written = (node: ASTNode): string =>
+    node.k === "Member" ? `${written(node.obj)}.${node.field}` : node.k === "Ref" ? node.n : "";
+  const visited = new Set<string>();
+  const columns = (node: ASTNode | undefined) => {
+    if (!node) return;
+    if (node.k === "Ref") {
+      if (!all.has(node.n) || visited.has(node.n)) return;
+      visited.add(node.n);
+      return columns(all.get(node.n));
+    }
+    const columnAt =
+      node.k === "Comp" && data.components && Object.hasOwn(data.components, node.name)
+        ? data.components[node.name]!
+        : [];
+    if (node.k === "Comp") {
+      for (const [at, arg] of node.args.entries()) {
+        if (!columnAt[at]) continue;
+        const rows = sample(arg);
+        const row: unknown = Array.isArray(rows) ? rows[0] : undefined;
+        if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+        // Its columns by name, for the builder to pick the one this argument takes.
+        const fields = Object.keys(row).slice(0, 8).join(", ");
+        problems.push({
+          kind: "rows",
+          fix: `${node.name} is given ${written(arg)} whole, which is a list of rows: give it one column of them, written ${written(arg)}.<column> (its columns: ${fields}).`,
+        });
+      }
+    }
+    children(node).forEach(columns);
+  };
+  columns(root);
+  // One line for a problem found twice, such as the same list given to two arguments.
+  return problems.filter(
+    (problem, at) => problems.findIndex((other) => other.fix === problem.fix) === at,
+  );
 }

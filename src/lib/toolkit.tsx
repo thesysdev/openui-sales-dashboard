@@ -75,7 +75,7 @@ export default defineToolkit({
         .string()
         .min(1)
         .describe(
-          "The change to make. Leave out a filter to add or take away: add_filters and remove_filters carry it, and what the dashboard shows stays.",
+          "The change to make, in the user's terms. Which filters are added or taken away is decided by add_filters and remove_filters, not by this text, so for such a change say only that, and nothing about what else the dashboard shows.",
         ),
       add_filters: z
         .array(filter)

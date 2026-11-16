@@ -30,6 +30,15 @@ const repairs = ((globalThis as Record<string, unknown>).__filterRepairs ??= new
 >;
 const MAX_REPAIRS = 2_000;
 
+// A repair is a generation nobody asked for by name, so each visitor gets a few an hour. Like the
+// record above this is one server's count; rate limits belong in front of the route.
+const MAX_PER_HOUR = 10;
+const HOUR_MS = 60 * 60_000;
+const recent = ((globalThis as Record<string, unknown>).__filterRepairTimes ??= new Map()) as Map<
+  string,
+  number[]
+>;
+
 // Only a version made just now is repaired. An older dashboard is checked and left as it is:
 // its owner didn't ask for it to change. The age is taken either way round, so a clock that
 // runs behind OpenUI Cloud's doesn't make every dashboard look new.
@@ -86,6 +95,10 @@ export async function POST(request: NextRequest) {
   const fresh =
     typeof artifact.updated_at === "number" &&
     Math.abs(Date.now() - artifact.updated_at * 1000) < FRESH_MS;
+  if (typeof artifact.updated_at !== "number") {
+    // Without it no version looks new and nothing is ever repaired: worth a line in the log.
+    console.warn(`Dashboard ${id} has no updated_at, so its filters can't be repaired`);
+  }
 
   // The version, or without one the program itself, so a changed program is a new version.
   const version = typeof artifact.version === "string" ? artifact.version : program;
@@ -95,6 +108,11 @@ export async function POST(request: NextRequest) {
   if (!fresh || version === before?.from || version === before?.made) {
     return Response.json({ problems: fixes });
   }
+  const times = (recent.get(visitor) ?? []).filter((time) => Date.now() - time < HOUR_MS);
+  if (times.length >= MAX_PER_HOUR) return Response.json({ problems: fixes });
+  recent.delete(visitor);
+  recent.set(visitor, [...times, Date.now()]);
+  if (recent.size > MAX_REPAIRS) recent.delete(recent.keys().next().value!);
 
   // Recorded before the repair starts: a request that arrives meanwhile finds it and stops.
   const repair: Repair = { from: version };
