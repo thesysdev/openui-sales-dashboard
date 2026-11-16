@@ -6,8 +6,7 @@ Built on Next.js, [assistant-ui](https://www.assistant-ui.com) and [OpenUI](http
 
 ## What's in it
 
-- **Home:** a one-sentence builder, "Show me [metric] by [split] for [range]", with a chip per slot and a **Build dashboard** button.
-- **Agent view:** three panes.
+- **Home:** a one-sentence builder, "Show me [metric] by [split] for [range]", with a chip per slot and a **Build dashboard** button.- **Agent view:** three panes.
   - A collapsible icon rail on the left lists your recent dashboards and has **View connected data** at the bottom.
   - The open dashboard fills the centre.
   - The conversation sits on the right and can be collapsed to a **Chat** button.
@@ -70,7 +69,7 @@ card (the tool's render) ◄─────────── streamed with the 
 1. The chat sends the thread to `/api/chat`. That route streams a reply from OpenUI Gateway with two tools, `create_dashboard` and `edit_dashboard`.
 2. The chat model decides the dashboard's filters from the request before anything is built: the period goes in `range`, and what the request splits by or narrows to goes in `filters`. `create_dashboard` runs on the server, writes that plan out for the builder, and starts generating the dashboard in OpenUI Cloud. It returns as soon as the dashboard has an id.
 3. The tool's card appears in the chat and opens the dashboard in the centre pane. `LiveArtifactRenderer` then streams the dashboard as it's generated.
-4. The dashboard loads its numbers with `Query()` calls. Each one goes to `/api/interpreter`, which runs the matching sales tool in `src/lib/data/sales.ts` against the database. The tools take the dashboard's filters as arguments of the same names (`range`, `region`, `category`, `brand`, `channel`), so a card follows the filter bar wherever its tool has the argument. Targets take `range`, `region` and `category` only.
+4. The dashboard loads its numbers with `Query()` calls. Each one goes to `/api/interpreter`, which runs the matching sales tool in `src/lib/data/sales.ts` against the database. Which filters there are is found in the database, not written in the code: every text column of the tables the tools read that holds between 2 and 50 values is a filter (region, device, brand and so on), and the date filter offers the periods the data is long enough for. The tools take `range` and any of those filters as an argument of its name, so a card follows the filter bar, and they split by any of them too (`group_by: "device"`). Targets are set per region or category only, so they take `range`, `region` and `category`. A filter's options are loaded the same way, from `get_filter_options`, so a new column, brand or channel appears in the filters without a code change.
 5. For a change, the model calls `edit_dashboard` with the dashboard's id, and the notch shows "Updating your dashboard…" until the new version is in. A filter the user wants added or taken away goes in `add_filters` or `remove_filters`.
 
 OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the browser only through `/api/interpreter`, from your server. Chats are kept in the browser's `localStorage`, with the chat each dashboard was made in, so picking a dashboard in the rail opens its chat.
@@ -80,7 +79,7 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 | File | Purpose |
 | --- | --- |
 | `src/lib/data/sales.ts`, `db.ts` | SQL-backed sales tools: KPIs, trends, breakdowns, top products, returns, targets vs actuals, customers, promotions |
-| `src/lib/data/filters.ts` | What dashboards filter by: the regions, categories, brands and channels in the data, and the date presets |
+| `src/lib/data/values.ts`, `filters.ts` | What dashboards filter by, found in the database: which columns are filters, the values of each, and the date periods the data is long enough for |
 | `src/lib/openui.ts` | `OpenUIClient`, the dashboard definition and base URL |
 | `src/lib/visitor.ts`, `src/proxy.ts` | Each browser's anonymous visitor id, which owns its dashboards |
 | `src/lib/base-path.ts` | The base path, for hand-written URLs |

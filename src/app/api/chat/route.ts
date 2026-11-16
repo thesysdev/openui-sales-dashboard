@@ -10,6 +10,7 @@ import {
   type UIMessage,
 } from "ai";
 import type { NextRequest } from "next/server";
+import { found } from "../../../lib/data/values";
 import { baseUrl } from "../../../lib/openui";
 import { chatPrompt } from "../../../lib/prompt";
 import toolkit from "../../../lib/toolkit";
@@ -78,9 +79,12 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: parsed.error }, { status: 400 });
   }
   const messages = parsed.thread;
+  // The filters, their values and the periods as the database holds them now, so the model plans
+  // a dashboard with ones that exist. When the database can't be read the chat still answers.
+  const instructions = chatPrompt(await found().catch(() => undefined));
   const system = parsed.dashboard
-    ? `${chatPrompt}\n\nOpen beside the chat now: the dashboard with artifact_id ${parsed.dashboard}.`
-    : chatPrompt;
+    ? `${instructions}\n\nOpen beside the chat now: the dashboard with artifact_id ${parsed.dashboard}.`
+    : instructions;
 
   // The chat runs on OpenUI Gateway's Chat Completions API, with the same key as the dashboards.
   const gateway = createOpenAI({ apiKey, baseURL: `${baseUrl}/v1/embed` });

@@ -1,25 +1,31 @@
-import { FILTERS, RANGES, optionLabel, type FilterName } from "./data/filters";
+import { OPTIONS_TOOL } from "./data/filters";
+import type { Filter, Found } from "./data/values";
 
-// Filters as openui-lang, written from the data's own filter list (data/filters.ts), so a filter
-// never offers a value the tools don't know. The plan for a dashboard (brief.ts) and the
-// dataset's examples are both written with these.
+// Filters as openui-lang. Which filters there are, and the periods the date filter offers, come
+// from the database (data/values.ts). A filter's options are not written in either: the dashboard
+// loads them from the data each time it opens. The plan for a dashboard (brief.ts) and the
+// examples are both written with these.
 
 const option = (value: string, label: string) =>
   `{value: ${JSON.stringify(value)}, label: ${JSON.stringify(label)}}`;
 
-/** The date filter, with the presets the tools read as `range`. */
-export const dateFilter = `DateRangeFilter($range, [${RANGES.map((range) => option(range.value, range.label)).join(", ")}], "Date range")`;
+/** The date filter, with the periods the data is long enough for, as the tools read `range`. */
+export const dateFilter = (ranges: Found["ranges"]) =>
+  `DateRangeFilter($range, [${ranges.map((range) => option(range.value, range.label)).join(", ")}], "Date range")`;
 
-/** A filter over one dimension, with all as its first option: a dropdown, or chips. */
-export function dimensionFilter(
-  name: FilterName,
+/** The name a dashboard gives the Query that loads its filters' options. */
+export const OPTIONS = "filterOptions";
+
+/** That Query, for the filters a dashboard has. Until it answers, each shows its all option alone. */
+export const optionsQuery = (filters: readonly Pick<Filter, "name" | "all">[]) =>
+  `${OPTIONS} = Query(${JSON.stringify(OPTIONS_TOOL)}, {}, {${filters.map(({ name, all }) => `${name}: [${option("", all)}]`).join(", ")}})`;
+
+/** A filter over one dimension, its options loaded by `optionsQuery`: a dropdown, or chips. */
+export const dimensionFilter = (
+  { name, label }: Pick<Filter, "name" | "label">,
   kind: "SelectFilter" | "ChipFilter" = "SelectFilter",
-): string {
-  const { label, all, values } = FILTERS[name];
-  const options = [option("", all), ...values.map((value) => option(value, optionLabel(value)))];
-  return `${kind}($${name}, [${options.join(", ")}], ${JSON.stringify(label)})`;
-}
+) => `${kind}($${name}, ${OPTIONS}.${name}, ${JSON.stringify(label)})`;
 
 /** The arguments that make a Query follow the filters: `range: $range, region: $region`. */
-export const filterArgs = (names: readonly FilterName[]) =>
+export const filterArgs = (names: readonly string[]) =>
   ["range: $range", ...names.map((name) => `${name}: $${name}`)].join(", ");

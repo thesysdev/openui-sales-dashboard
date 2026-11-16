@@ -1,27 +1,46 @@
 import { parseExpression, parseMessage, split, tokenize, type ASTNode } from "@openuidev/lang-core";
-import { dataTools } from "./data";
-import { FILTERS } from "./data/filters";
+import { dataTools, ignored } from "./data";
 
 // Reads a dashboard's program, with the parser the renderer uses, for a change to it: which
-// filters its FilterBar has, by the variables it gave them. It knows the data only by its tools'
-// argument names and its filter list.
+// filters its FilterBar has, by the variables it gave them, and which tools its Queries call. It
+// knows the data only by its tools' arguments and by the names of the filters found in the
+// database.
 
-/** What is known of the data: each tool's arguments, and the filters by name. */
-export type Dataset = {
-  tools: Record<string, { takes: readonly string[] }>;
-  filters: Record<string, unknown>;
+/**
+ * What a tool takes: the arguments it names, whether it takes any other filter by name (the
+ * tools that follow every filter do), and the ones a call can't follow given its other arguments.
+ */
+export type Tool = {
+  takes: readonly string[];
+  open: boolean;
+  ignores?: (args: Record<string, unknown>) => string[];
 };
 
-/** The dataset in ./data. */
-export const dataset: Dataset = {
-  tools: Object.fromEntries(
-    Object.entries(dataTools).map(([name, tool]) => [
+/** The data tools in ./data, by what each takes. */
+export const tools: Record<string, Tool> = Object.fromEntries(
+  Object.entries(dataTools).map(([name, tool]) => {
+    const { properties = {}, additionalProperties } = tool.parameters as {
+      properties?: object;
+      additionalProperties?: unknown;
+    };
+    return [
       name,
-      { takes: Object.keys((tool.parameters as { properties?: object }).properties ?? {}) },
-    ]),
-  ),
-  filters: FILTERS,
-};
+      {
+        takes: Object.keys(properties),
+        open: Boolean(additionalProperties),
+        ignores: ignored[name],
+      },
+    ];
+  }),
+);
+
+/**
+ * Whether a tool's Queries change with an argument; with `args`, whether the Query that writes
+ * those arguments does.
+ */
+export const follows = (tool: Tool, argument: string, args?: Record<string, unknown>) =>
+  (tool.open || tool.takes.includes(argument)) &&
+  !(args && tool.ignores?.(args).includes(argument));
 
 // Where the library's components hold what is read here.
 const BAR = "FilterBar";
@@ -79,13 +98,16 @@ export type Current = {
    * as ("" for a control no Query passes, such as a switch read on the page).
    */
   bar: { variable: string; argument: string }[];
+  /** Its Queries: the tool each calls, and the arguments it writes in as they are. */
+  queries: { tool: string; args: Record<string, unknown> }[];
 };
 
 /**
- * Reads a dashboard for a change to it. Nothing comes back for a program that isn't whole yet:
- * one still being written may not have reached its FilterBar.
+ * Reads a dashboard for a change to it; `filters` are the names of the filters the data has.
+ * Nothing comes back for a program that isn't whole yet: one still being written may not have
+ * reached its FilterBar.
  */
-export function readDashboard(program: string, data: Dataset = dataset): Current | undefined {
+export function readDashboard(program: string, filters: readonly string[]): Current | undefined {
   if (!parseMessage(program).end) return undefined;
   const all = statements(program);
   // Follows a name to the statement it stands for. Names that lead back to themselves end where
@@ -95,11 +117,23 @@ export function readDashboard(program: string, data: Dataset = dataset): Current
     return resolve(all.get(node.n), seen.add(node.n));
   };
 
+  const queries = [...all.values()].filter((statement): statement is Comp =>
+    isComp(statement, QUERY),
+  );
   /** The arguments each Query writes out, by name. */
-  const passes = [...all.values()].flatMap((statement) => {
-    if (!isComp(statement, QUERY)) return [];
-    const args = resolve(statement.args[1]);
+  const passes = queries.flatMap((query) => {
+    const args = resolve(query.args[1]);
     return args?.k === "Obj" ? args.entries : [];
+  });
+  const calls = queries.flatMap((query) => {
+    const tool = resolve(query.args[0]);
+    const args = resolve(query.args[1]);
+    if (tool?.k !== "Str") return [];
+    // Only what is written in: an argument a variable sets has no value to read here.
+    const written = (args?.k === "Obj" ? args.entries : []).flatMap(([name, value]) =>
+      value.k === "Str" || value.k === "Num" ? [[name, value.v] as const] : [],
+    );
+    return [{ tool: tool.v, args: Object.fromEntries(written) }];
   });
 
   // The FilterBar that is shown: the first one the root reaches.
@@ -129,8 +163,10 @@ export function readDashboard(program: string, data: Dataset = dataset): Current
     return bound?.k === "StateRef" ? [bound.n] : [];
   });
 
+  // What a variable can be the argument of when no Query passes it: a filter, or the date.
   const known = (argument: string) =>
-    Object.values(data.tools).some((tool) => tool.takes.includes(argument));
+    filters.includes(argument) ||
+    Object.values(tools).every((tool) => !tool.takes.length || tool.takes.includes(argument));
   return {
     bar: variables.map((variable) => {
       const passed = passes.flatMap(([argument, value]) =>
@@ -139,10 +175,9 @@ export function readDashboard(program: string, data: Dataset = dataset): Current
       const named = variable.slice(1);
       // A filter is passed as the argument it narrows; unpassed, it is the one of its name.
       const argument =
-        passed.find((name) => Object.hasOwn(data.filters, name)) ??
-        passed[0] ??
-        (known(named) ? named : "");
+        passed.find((name) => filters.includes(name)) ?? passed[0] ?? (known(named) ? named : "");
       return { variable, argument };
     }),
+    queries: calls,
   };
 }

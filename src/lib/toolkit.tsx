@@ -4,19 +4,20 @@ import { defineToolkit } from "@assistant-ui/react";
 import { z } from "zod";
 import { DashboardCard } from "../components/dashboard";
 import { dashboardBrief, filterChange } from "./brief";
-import { readDashboard } from "./program";
-import { DEFAULT_RANGE, FILTERS, FILTER_NAMES, RANGES, RANGE_VALUES } from "./data/filters";
+import { found } from "./data/values";
 import { baseUrl, dashboards, openui, userId } from "./openui";
+import { readDashboard } from "./program";
 
-// A filter in a dashboard's plan. The names and their values are the data's own
-// (data/filters.ts), listed here so the model picks a value that exists.
+// A filter in a dashboard's plan. Which filters there are, their values and the periods are found
+// in the database (data/values.ts), so nothing here names one: the chat's instructions list them
+// (prompt.ts) and the plan is checked against them (brief.ts).
 const filter = z.object({
-  name: z.enum(FILTER_NAMES),
+  name: z.string().describe("A filter your instructions list, by its name."),
   value: z
     .string()
     .optional()
     .describe(
-      `The value it opens on, when the request narrows to one: ${FILTER_NAMES.map((name) => `${name} is one of ${FILTERS[name].values.join(", ")}`).join("; ")}. Leave out to open on all.`,
+      "The value it opens on, when the request narrows to one: a value your instructions list for that filter, spelled as listed. Leave out to open on all.",
     ),
 });
 
@@ -41,23 +42,23 @@ export default defineToolkit({
           "What the user wants to learn, in their own terms, and what it is for if they said. The builder reads the data tools itself and chooses the measures, the charts and the layout, so name one only if the user did. Leave out the period and the filters: `range` and `filters` set them, and every part of the dashboard follows them.",
         ),
       range: z
-        .enum(RANGE_VALUES)
+        .string()
         .optional()
         .describe(
-          `The period the dashboard opens on, which the reader can change: ${RANGES.map(({ value, label }) => `"${value}" ${label.toLowerCase()}`).join(", ")}. Default "${DEFAULT_RANGE}".`,
+          "The period the dashboard opens on, which the reader can change: one of the periods your instructions list, by its value. Leave out when the request names none.",
         ),
       filters: z
         .array(filter)
         .optional()
         .describe(
-          `The filters the dashboard has besides the date, decided now so it is built around them: each of ${FILTER_NAMES.join(", ")} that the request splits by or narrows to, and any the user asked for. Leave out the ones it doesn't mention; the user can ask for those later.`,
+          "The filters the dashboard has besides the date, decided now so it is built around them: each filter your instructions list that the request splits by or narrows to, and any the user asked for. Leave out the ones it doesn't mention; the user can ask for those later.",
         ),
     }),
     // The plan (the period and the filters, read off the request) is written out for the builder
     // here, with which Queries pass each one, so no filter is left to chance.
-    execute: ({ title, prompt, range = DEFAULT_RANGE, filters = [] }, { abortSignal }) =>
+    execute: async ({ title, prompt, range, filters = [] }, { abortSignal }) =>
       dashboards.create(
-        { title, prompt: `${prompt}\n\n${dashboardBrief(range, filters)}` },
+        { title, prompt: `${prompt}\n\n${await dashboardBrief(range, filters)}` },
         { userId: userId() },
         { signal: abortSignal },
       ),
@@ -83,11 +84,13 @@ export default defineToolkit({
           "Filters the user wants added. A value they name picks the filter that has it: pass that filter with the value, whether or not the dashboard has it yet, without asking.",
         ),
       remove_filters: z
-        .array(z.enum(FILTER_NAMES))
+        .array(z.string())
         .optional()
-        .describe("Filters the user wants taken away, each one named."),
+        .describe("Filters the user wants taken away, each by its name."),
     }),
     execute: async ({ id, prompt, add_filters, remove_filters }, { abortSignal }) => {
+      const data = await found();
+      const names = data.filters.map(({ name }) => name);
       // The dashboard as it is, so the change is written against the filters it has and a new
       // card follows them. The frontend token reads only this visitor's dashboards. When the
       // program can't be read, or isn't whole yet, the change still goes, with the added filters
@@ -103,15 +106,20 @@ export default defineToolkit({
         .then((response) => (response.ok ? response.json() : undefined))
         .then((artifact?: { content?: unknown }) =>
           // Nothing for a program still being written: it may not have reached its filters.
-          typeof artifact?.content === "string" ? readDashboard(artifact.content) : undefined,
+          typeof artifact?.content === "string"
+            ? readDashboard(artifact.content, names)
+            : undefined,
         )
         .catch(() => undefined);
-      const filters = filterChange(add_filters, remove_filters, now);
-      return dashboards.edit(
-        { id, prompt: filters ? `${prompt}\n\n${filters}` : prompt },
+      const { brief, leftOut } = await filterChange(add_filters, remove_filters, now, data);
+      const response = await dashboards.edit(
+        { id, prompt: brief ? `${prompt}\n\n${brief}` : prompt },
         { userId: userId() },
         { signal: abortSignal },
       );
+      // The result opens with a sentence for the model. A filter that was left out, because
+      // nothing on the dashboard would change with it, is said first, so the reply doesn't claim it.
+      return leftOut ? `${leftOut}\n\n${response}` : response;
     },
     // In the message, not folded into the tool-call group.
     display: "standalone",

@@ -1,13 +1,34 @@
 import { dataTools } from "./data";
+import { firstMonth, type Found } from "./data/values";
 
 // What dashboards can show, from the data tools' own descriptions.
 const data = Object.entries(dataTools)
   .map(([name, tool]) => `- ${name}: ${tool.description}`)
   .join("\n");
 
-export const chatPrompt = `You are the sales analytics copilot for Northstar, a multi-brand apparel, footwear and accessories retailer. You build live dashboards from its sales database and answer in plain text; dashboards are artifacts the user opens beside the chat.
+/**
+ * What the database holds now, as the model plans a dashboard with it: each filter by the name it
+ * is passed as, with the column it reads and its values, and the periods the data is long enough
+ * for. The column tells apart filters whose names are close.
+ */
+const held = (found?: Found) =>
+  found
+    ? `
 
-The data: orders from November 2024 to the latest order, in USD. "Last month", "the last 6 months" and other relative ranges count back from the last day with orders, so describe them as months back rather than exact dates. Monthly series and targets end at the last whole month, so they never close on a partial month. Net sales means revenue after discounts and before refunds; cancelled orders, test orders, and internal customers are always excluded. Brands: Northstar, Northstar Footwear, Northstar Studio, N. Active, North & Co., Weekend Supply. Categories: apparel, footwear, accessories. Regions: West, South, Midwest, Northeast. Dashboards can break sales down by region, state, category, subcategory, brand, channel (traffic source), and device, and can show targets vs actuals, returns, customers, and promotions.
+The filters the data has now, each by its name, with the column it reads and its values spelled as a filter takes them:
+${found.filters.map(({ name, column, values }) => `- ${name} (${column}): ${values.join(", ")}`).join("\n")}
+The periods a dashboard can open on: ${found.ranges.map(({ value, label }) => `"${value}" ${label.toLowerCase()}`).join(", ")}. It opens on "${found.opens}" when the request names none.`
+    : "";
+
+/** Where the data starts, as the database has it: "from November 2024 ". */
+const since = (found?: Found) => (found ? `from ${firstMonth(found)} ` : "");
+
+/** The chat's instructions, with the filters, values and periods found in the database when it answered. */
+export const chatPrompt = (
+  found?: Found,
+) => `You are the sales analytics copilot for Northstar, a multi-brand apparel, footwear and accessories retailer. You build live dashboards from its sales database and answer in plain text; dashboards are artifacts the user opens beside the chat.
+
+The data: orders ${since(found)}to the latest order, in USD. "Last month", "the last 6 months" and other relative ranges count back from the last day with orders, so describe them as months back rather than exact dates. Monthly series and targets end at the last whole month, so they never close on a partial month. Net sales means revenue after discounts and before refunds; cancelled orders, test orders, and internal customers are always excluded. Dashboards can show sales, targets vs actuals, returns, customers, and promotions.${held(found)}
 
 Dashboards load their own data from these tools every time they are opened:
 ${data}

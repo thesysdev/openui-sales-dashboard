@@ -17,17 +17,19 @@ import {
 } from "./db";
 import { record, toolContext } from "./activity";
 import { cacheHas, cached, int, oneOf, text } from "./fetch";
-import { FILTERS, FILTER_NAMES, optionLabel, type FilterName } from "./filters";
+import { OPTIONS_TOOL, optionLabel } from "./filters";
 import { dataTool } from "./tool";
+import { filterOptions, found, foundFilters, type Filter } from "./values";
 
 // Data tools over the Neon sales database (schema `retail`): 100k orders from Nov 2024 to
 // its latest order, in USD. "Net sales" is revenue after discounts (before refunds): completed, captured
 // orders only, with test orders and internal customers excluded. Refunds come from returns,
 // by the date they were processed. Results are cached for 3 minutes.
 //
-// Every tool takes the same frame: `range`, a dashboard's date filter value as is, and the
-// region, category, brand and channel filters. A dashboard passes its filters into each Query
-// unchanged, so every card follows them, and never has to work a date out itself.
+// Every tool takes `range`, a dashboard's date filter value as is, and any filter the data has
+// (values.ts finds them in the database) as an argument of the filter's name. A dashboard passes
+// its filters into each Query unchanged, so every card follows them, and never has to work a
+// date out itself.
 
 const TTL = 3 * 60_000;
 const run = <T>(name: string, args: Record<string, unknown>, load: () => Promise<T>) => {
@@ -44,10 +46,37 @@ const run = <T>(name: string, args: Record<string, unknown>, load: () => Promise
 
 const INTERVALS = ["day", "week", "month"] as const;
 type Interval = (typeof INTERVALS)[number];
-const TREND_DIMS = ["none", "region", "category", "brand", "channel", "device"] as const;
-const BREAKDOWN_DIMS = Object.keys(DIMENSIONS) as Dimension[];
-/** What customers, promotions and returns can be split by: the filter dimensions. */
-const GROUPS = ["none", ...FILTER_NAMES] as const;
+
+// What a tool splits by is found in the data too: any filter it has (values.ts), by the filter's
+// name. The columns the tools already read (DIMENSIONS) stay available when one of them isn't a
+// filter there, as a column with too many values to pick from.
+
+/** A series per value stays readable up to this many; a split with more is a table or a bar. */
+const MOST_SERIES = 8;
+/** The names the data can be split by; with `most`, only those with that many values or fewer. */
+const splitNames = (most?: number): string[] => [
+  ...new Set([
+    ...foundFilters()
+      .filter(({ values }) => !most || values.length <= most)
+      .map(({ name }) => name),
+    // Before the data has been looked at, the columns the tools read are all there is to offer.
+    ...(most && foundFilters().length ? [] : Object.keys(DIMENSIONS)),
+  ]),
+];
+/** The column a split reads, and whether reading it needs the products join. */
+const splitColumn = (name: string): { sql: string; products: boolean } =>
+  foundFilters().find((filter) => filter.name === name) ?? DIMENSIONS[name as Dimension];
+/**
+ * A split argument: the tool's own choices, then every name the data can be split by. Read each
+ * time a dashboard is generated (tool.ts), so the names are the ones the data has then.
+ */
+const splitParam = (own: readonly string[], fallback: string, most?: number) =>
+  z
+    .enum([...new Set([...own, fallback, ...splitNames(most)])] as [string, ...string[]])
+    .default(fallback);
+/** The split a call asks for: one of the tool's own choices or of the data's; otherwise `fallback`. */
+const splitOf = (value: unknown, own: readonly string[], fallback: string, most?: number) =>
+  oneOf(value, [...own, ...splitNames(most)], fallback);
 
 const range = z
   .string()
@@ -56,21 +85,24 @@ const range = z
     'The dashboard\'s date filter value, as is: "1m", "3m", "6m" or "12m" (months back from the last day of data), "30d", "ytd", "lifetime", or a custom "YYYY-MM-DD..YYYY-MM-DD". Default "6m".',
   );
 
-/** A filter's argument: one of the values in the data, or "" for all. */
-const filterParam = (name: FilterName) =>
-  z
-    .enum(["", ...FILTERS[name].values])
-    .optional()
-    .describe(`${FILTERS[name].label} filter. "" for all.`);
+/** A filter's argument: one of the values the options tool lists for it, or "" for all. */
+const filterParam = (label: string) =>
+  z.string().optional().describe(`${label} filter: a value ${OPTIONS_TOOL} lists. "" for all.`);
 
-/** The arguments every tool takes: the date range and the four filters. */
-const frame = {
-  range,
-  region: filterParam("region"),
-  category: filterParam("category"),
-  brand: filterParam("brand"),
-  channel: filterParam("channel"),
-};
+/** What every tool takes besides its own arguments: the date range. */
+const frame = { range };
+
+/** A tool's arguments when it follows the filters: its own, and any filter by its name. */
+const following = <Shape extends z.ZodRawShape>(shape: Shape) =>
+  z
+    .object(shape)
+    .catchall(
+      z
+        .string()
+        .describe(
+          `Any filter ${OPTIONS_TOOL} lists, as an argument of the filter's name: one of that filter's values, or "" for all.`,
+        ),
+    );
 
 /**
  * The arguments with `range` read into months or from/to: "3m" is 3 months back, "30d" 30 days,
@@ -107,7 +139,8 @@ async function withRange(args: Record<string, unknown>): Promise<Record<string, 
   };
 }
 
-type Slice = Record<FilterName, string>;
+/** The filters a call sets, by name, each as its column holds the value. */
+type Slice = Record<string, string>;
 
 /** One filter value, lower-cased; "", "all", "All regions" and the like mean no filter. */
 function sliceValue(value: unknown): string {
@@ -115,18 +148,29 @@ function sliceValue(value: unknown): string {
   return /^(all|any)\b/.test(picked) ? "" : picked;
 }
 
-function readSlice(args: Record<string, unknown>): Slice {
-  const slice = Object.fromEntries(
-    FILTER_NAMES.map((key) => [key, sliceValue(args[key])]),
-  ) as Slice;
-  // A channel may arrive as rows show it: "Paid search" for paid_search.
-  slice.channel = slice.channel.replace(/ /g, "_");
+/** The data's filters as of the last call, for the SQL that narrows by them. */
+let filters: Filter[] = [];
+
+/**
+ * Reads a call's filters: any argument named after a filter the data has. A value may arrive as
+ * a reader sees it ("Paid search") or as the column has it ("paid_search").
+ */
+async function readSlice(args: Record<string, unknown>): Promise<Slice> {
+  ({ filters } = await found());
+  const slice: Slice = {};
+  for (const { name, values, raw } of filters) {
+    const picked = sliceValue(args[name]);
+    if (!picked) continue;
+    const same = (value: string) => value.toLowerCase() === picked;
+    const at = values.findIndex(same);
+    slice[name] = (raw[at < 0 ? raw.findIndex(same) : at] ?? picked).toLowerCase();
+  }
   return slice;
 }
 
 /**
  * SQL for a slice, numbering its parameters from `first`: ` AND lower(o.shipping_region) = $3…`,
- * and whether it needs the products join (category and brand live on products).
+ * and whether it needs the products join (some filters are columns of the products tables).
  */
 function sliceWhere(
   slice: Slice,
@@ -134,12 +178,15 @@ function sliceWhere(
 ): { sql: string; params: string[]; products: boolean } {
   const params: string[] = [];
   let sql = "";
-  for (const key of FILTER_NAMES) {
-    if (!slice[key]) continue;
-    params.push(slice[key]);
-    sql += ` AND lower(${DIMENSIONS[key].sql}) = $${first + params.length - 1}`;
+  let products = false;
+  for (const filter of filters) {
+    const value = slice[filter.name];
+    if (!value) continue;
+    params.push(value);
+    sql += ` AND lower(${filter.sql}) = $${first + params.length - 1}`;
+    products ||= filter.products;
   }
-  return { sql, params, products: Boolean(slice.category || slice.brand) };
+  return { sql, params, products };
 }
 
 /** Period expression and label format for a trend interval. */
@@ -167,9 +214,20 @@ async function overTime(ranged: Record<string, unknown>, from: string, to: strin
 }
 
 const tools = {
+  [OPTIONS_TOOL]: dataTool(
+    "The options of a dashboard's filters, read from the data: for each filter the data has, under the filter's name, a list of {value, label} that starts with the all option. A filter's options are this list as is, never written in. Takes no arguments.",
+    z.object({}),
+    {
+      filter_name: [
+        { value: "", label: "All" },
+        { value: "A value", label: "A value" },
+      ],
+    },
+    () => run("filter_options", {}, filterOptions),
+  ),
   get_sales_overview: dataTool(
-    "Headline KPIs for the range: net_sales (USD, after discounts, before refunds), orders, units, aov (average order value), discount_amount and discount_rate_pct, gross_margin_pct, refund_amount, returned_units and refund_rate_pct (refunds processed in the range as a share of net sales). previous {net_sales, orders, units, aov, gross_margin_pct, refund_rate_pct} is the same for the range of the same length just before, and change {net_sales_pct, orders_pct, aov_pct} the move from it; both are null when that earlier range starts before the data does (a long range, or lifetime). Follows the range, region, category, brand and channel filters.",
-    z.object(frame),
+    "Headline KPIs for the range: net_sales (USD, after discounts, before refunds), orders, units, aov (average order value), discount_amount and discount_rate_pct, gross_margin_pct, refund_amount, returned_units and refund_rate_pct (refunds processed in the range as a share of net sales). previous {net_sales, orders, units, aov, gross_margin_pct, refund_rate_pct} is the same for the range of the same length just before, and change {net_sales_pct, orders_pct, aov_pct} the move from it; both are null when that earlier range starts before the data does (a long range, or lifetime). Follows the range filter and every filter get_filter_options lists.",
+    following(frame),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -198,7 +256,7 @@ const tools = {
       const prev = previousRange(from, to);
       // A previous range reaching before the data would compare with a few weeks of orders.
       const comparable = prev.from >= (await dataDays()).first;
-      const slice = readSlice(args);
+      const slice = await readSlice(args);
       return run("overview", { from, to, ...slice }, async () => {
         const filter = sliceWhere(slice, 4);
         const joins = filter.products ? PRODUCTS_JOIN : "";
@@ -291,12 +349,13 @@ const tools = {
   ),
 
   get_sales_trend: dataTool(
-    "Net sales (USD) and orders over time as aligned series: periods (the labels; weeks are labelled by their Monday) and one series per group with net_sales and orders per period, total, and change_pct (last period vs the one before). group_by none gives a single 'All' series; region, category, brand, channel or device gives one series each. interval auto fits the range: days up to 2 months, weeks up to 6 months, months beyond. Monthly series end at the last whole month. Follows the range, region, category, brand and channel filters.",
-    z.object({
-      group_by: z.enum(TREND_DIMS).default("none"),
-      interval: z.enum(["auto", ...INTERVALS]).default("auto"),
-      ...frame,
-    }),
+    "Net sales (USD) and orders over time as aligned series: periods (the labels; weeks are labelled by their Monday) and one series per group with net_sales and orders per period, total, and change_pct (last period vs the one before). group_by none gives a single 'All' series; a filter's name gives one series per value of it (a filter with a few values). interval auto fits the range: days up to 2 months, weeks up to 6 months, months beyond. Monthly series end at the last whole month. Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        group_by: splitParam(["none"], "none", MOST_SERIES),
+        interval: z.enum(["auto", ...INTERVALS]).default("auto"),
+        ...frame,
+      }),
     {
       from: "2026-08-01",
       to: "2026-10-31",
@@ -321,7 +380,8 @@ const tools = {
       ],
     },
     async (args, signal) => {
-      const groupBy = oneOf(args.group_by, TREND_DIMS, "none");
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["none"], "none", MOST_SERIES);
       const ranged = await withRange(args);
       let { from, to } = await dateRange(ranged);
       // Dashboards made before `range` and "auto" expect months when they name no interval.
@@ -334,12 +394,11 @@ const tools = {
       const interval: Interval =
         asked !== "auto" ? asked : span <= 62 ? "day" : span <= 200 ? "week" : "month";
       if (interval === "month") ({ from, to } = await dateRange(ranged, 6, { wholeMonths: true }));
-      const slice = readSlice(args);
       return run("trend", { from, to, interval, groupBy, ...slice }, async () => {
-        const dim = groupBy === "none" ? "'All'" : DIMENSIONS[groupBy as Dimension].sql;
+        const dim = groupBy === "none" ? "'All'" : splitColumn(groupBy).sql;
         const filter = sliceWhere(slice, 3);
         const joins =
-          filter.products || (groupBy !== "none" && DIMENSIONS[groupBy as Dimension].products)
+          filter.products || (groupBy !== "none" && splitColumn(groupBy).products)
             ? PRODUCTS_JOIN
             : "";
         const rows = await query(
@@ -384,12 +443,13 @@ const tools = {
   ),
 
   get_sales_breakdown: dataTool(
-    "Net sales (USD) split by one dimension (region, state, category, subcategory, brand, channel (traffic source) or device), sorted by net sales: each row's name, net_sales, share_pct, orders, units, aov, gross_margin_pct, refund_amount and returned_units (returns processed in the range), and return_rate_pct (returned units as a share of units sold). Follows the range, region, category, brand and channel filters.",
-    z.object({
-      dimension: z.enum(BREAKDOWN_DIMS as [Dimension, ...Dimension[]]).default("category"),
-      limit: z.number().int().min(3).max(25).default(10).describe("How many rows, 3 to 25"),
-      ...frame,
-    }),
+    "Net sales (USD) split by one dimension, any filter get_filter_options lists by its name (channel is the order's traffic source), sorted by net sales: each row's name, net_sales, share_pct, orders, units, aov, gross_margin_pct, refund_amount and returned_units (returns processed in the range), and return_rate_pct (returned units as a share of units sold). Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        dimension: splitParam([], "category"),
+        limit: z.number().int().min(3).max(25).default(10).describe("How many rows, 3 to 25"),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -412,11 +472,11 @@ const tools = {
     },
     async (args, signal) => {
       const { from, to } = await dateRange(await withRange(args));
-      const dimension = oneOf(args.dimension, BREAKDOWN_DIMS, "category");
+      const slice = await readSlice(args);
+      const dimension = splitOf(args.dimension, [], "category");
       const limit = int(args.limit, 10, 3, 25);
-      const slice = readSlice(args);
       return run("breakdown", { from, to, dimension, limit, ...slice }, async () => {
-        const { sql: dim, products } = DIMENSIONS[dimension];
+        const { sql: dim, products } = splitColumn(dimension);
         const filter = sliceWhere(slice, 3);
         const joins = products || filter.products ? PRODUCTS_JOIN : "";
         const params = [from, to, ...filter.params];
@@ -476,19 +536,20 @@ const tools = {
   ),
 
   get_top_products: dataTool(
-    "Top products (styles) ranked by net_sales, units, margin (gross margin %) or return_rate: each row's name, brand, category, subcategory, net_sales (USD), units, orders, gross_margin_pct, refund_amount, and return_rate_pct (returned units / units sold, returns processed in the range). group_by region, category, brand or channel ranks within each instead: every row then also has group, and there are up to 5 rows per group, the biggest group first (one Table, grouped by that column). Follows the range, region, category, brand and channel filters.",
-    z.object({
-      metric: z.enum(["net_sales", "units", "margin", "return_rate"]).default("net_sales"),
-      group_by: z.enum(GROUPS).default("none"),
-      limit: z
-        .number()
-        .int()
-        .min(3)
-        .max(25)
-        .optional()
-        .describe("How many products, 3 to 25. Default 10. At most 5 per group."),
-      ...frame,
-    }),
+    "Top products (styles) ranked by net_sales, units, margin (gross margin %) or return_rate: each row's name, brand, category, subcategory, net_sales (USD), units, orders, gross_margin_pct, refund_amount, and return_rate_pct (returned units / units sold, returns processed in the range). group_by a filter's name ranks within each of its values instead: every row then also has group, and there are up to 5 rows per group, the biggest group first (one Table, grouped by that column). Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        metric: z.enum(["net_sales", "units", "margin", "return_rate"]).default("net_sales"),
+        group_by: splitParam(["none"], "none"),
+        limit: z
+          .number()
+          .int()
+          .min(3)
+          .max(25)
+          .optional()
+          .describe("How many products, 3 to 25. Default 10. At most 5 per group."),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -516,15 +577,15 @@ const tools = {
         ["net_sales", "units", "margin", "return_rate"],
         "net_sales",
       );
-      const groupBy = oneOf(args.group_by, GROUPS, "none");
-      const slice = readSlice(args);
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["none"], "none");
       // A grouped table lists every group, so each gets 5 at most; one group alone gets the full list.
       const grouped = groupBy !== "none" && !slice[groupBy];
       const limit = grouped ? Math.min(5, int(args.limit, 5, 3, 25)) : int(args.limit, 10, 3, 25);
       return run("top-products", { from, to, metric, groupBy, limit, ...slice }, async () => {
         const { sql: filters, params: values } = sliceWhere(slice, 3);
         const params = [from, to, ...values];
-        const grp = groupBy === "none" ? "'All'" : DIMENSIONS[groupBy].sql;
+        const grp = groupBy === "none" ? "'All'" : splitColumn(groupBy).sql;
         const [sales, refunds] = await Promise.all([
           query(
             `SELECT ${grp} AS grp, p.style_id, p.name, p.brand, p.category, p.subcategory,
@@ -613,11 +674,12 @@ const tools = {
   ),
 
   get_returns_overview: dataTool(
-    "Returns and refunds (by the date the return was processed): refund_amount (USD), returned_units, return_rate_pct (returned units / units sold in the range) and restocked_pct for the whole range, previous {refund_amount, returned_units, return_rate_pct} for the range just before (null when it starts before the data), over_time (returned_units, refund_amount and return_rate_pct per period: days, weeks or months, whichever fits the range), and rows split by reason, month, region, category, brand or channel: each row's name, returned_units, refund_amount, share_pct of returned units, and (for every split but reason) return_rate_pct, the returned units as a share of that row's units sold. Follows the range, region, category, brand and channel filters.",
-    z.object({
-      by: z.enum(["reason", "month", ...FILTER_NAMES]).default("reason"),
-      ...frame,
-    }),
+    "Returns and refunds (by the date the return was processed): refund_amount (USD), returned_units, return_rate_pct (returned units / units sold in the range) and restocked_pct for the whole range, previous {refund_amount, returned_units, return_rate_pct} for the range just before (null when it starts before the data), over_time (returned_units, refund_amount and return_rate_pct per period: days, weeks or months, whichever fits the range), and rows split by reason, month or a filter's name: each row's name, returned_units, refund_amount, share_pct of returned units, and (for every split but reason) return_rate_pct, the returned units as a share of that row's units sold. Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        by: splitParam(["reason", "month"], "reason"),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -663,7 +725,8 @@ const tools = {
       ],
     },
     async (args, signal) => {
-      const by = oneOf(args.by, ["reason", "month", ...FILTER_NAMES], "reason");
+      const slice = await readSlice(args);
+      const by = splitOf(args.by, ["reason", "month"], "reason");
       const ranged = await withRange(args);
       const { from, to } = await dateRange(ranged, 6, {
         wholeMonths: by === "month",
@@ -671,7 +734,6 @@ const tools = {
       const series = modern(args) ? await overTime(ranged, from, to) : null;
       const prev = previousRange(from, to);
       const comparable = prev.from >= (await dataDays()).first;
-      const slice = readSlice(args);
       return run("returns", { from, to, by, series, ...slice }, async () => {
         const month = (column: string) => `to_char(date_trunc('month', ${column}), 'YYYY-MM')`;
         // The split, on returns (by when they were processed) and on sales (by when they were placed).
@@ -680,13 +742,13 @@ const tools = {
             ? "coalesce(r.return_reason, 'unknown')"
             : by === "month"
               ? month("r.processed_at")
-              : DIMENSIONS[by].sql;
+              : splitColumn(by).sql;
         const soldDim =
-          by === "month" ? month("o.placed_at") : by === "reason" ? null : DIMENSIONS[by].sql;
+          by === "month" ? month("o.placed_at") : by === "reason" ? null : splitColumn(by).sql;
         const filter = sliceWhere(slice, 3);
         const sliceJoins = filter.products ? PRODUCTS_JOIN : "";
         const joins =
-          filter.products || (by !== "reason" && by !== "month" && DIMENSIONS[by].products)
+          filter.products || (by !== "reason" && by !== "month" && splitColumn(by).products)
             ? PRODUCTS_JOIN
             : "";
         const params = [from, to, ...filter.params];
@@ -816,8 +878,8 @@ const tools = {
     z.object({
       scope: z.enum(["business", "region", "category"]).default("business"),
       range,
-      region: frame.region,
-      category: frame.category,
+      region: filterParam("Region"),
+      category: filterParam("Category"),
     }),
     {
       scope: "region",
@@ -1095,14 +1157,14 @@ const tools = {
   ),
 
   get_customer_insights: dataTool(
-    "Customers who ordered in the range: customers, new_customers (first-ever order in the range), returning_customers (first ordered before it), new_share_pct, repeat_rate_pct (the share who ordered more than once in the range), orders, net_sales (USD), aov and orders_per_customer; previous {customers, new_customers, orders, net_sales} for the range just before (null when it starts before the data); over_time, new_customers, returning_customers, orders and net_sales per period (days, weeks or months, whichever fits the range); new_by_channel, new customers by acquisition channel; and rows, the same counts split by group_by (region, category, brand or channel: customers who ordered in each). Follows the range, region, category, brand and channel filters.",
-    z.object({
-      group_by: z
-        .enum(GROUPS)
-        .default("none")
-        .describe("What rows are split by. none leaves rows empty."),
-      ...frame,
-    }),
+    "Customers who ordered in the range: customers, new_customers (first-ever order in the range), returning_customers (first ordered before it), new_share_pct, repeat_rate_pct (the share who ordered more than once in the range), orders, net_sales (USD), aov and orders_per_customer; previous {customers, new_customers, orders, net_sales} for the range just before (null when it starts before the data); over_time, new_customers, returning_customers, orders and net_sales per period (days, weeks or months, whichever fits the range); new_by_channel, new customers by acquisition channel; and rows, the same counts split by group_by (a filter's name: customers who ordered in each). Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        group_by: splitParam(["none"], "none").describe(
+          "What rows are split by. none leaves rows empty.",
+        ),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -1159,10 +1221,10 @@ const tools = {
       const series = modern(args)
         ? await overTime(ranged, from, to)
         : { interval: "month" as Interval, from, to };
-      const groupBy = oneOf(args.group_by, GROUPS, "none");
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["none"], "none");
       const prev = previousRange(from, to);
       const comparable = prev.from >= (await dataDays()).first;
-      const slice = readSlice(args);
       return run("customers", { from, to, groupBy, series, ...slice }, async () => {
         const filter = sliceWhere(slice, 3);
         const params = [from, to, ...filter.params];
@@ -1192,7 +1254,7 @@ const tools = {
         const [all, before, groups, months, channels] = await Promise.all([
           counts("'All'", false),
           comparable ? counts("'All'", false, [prev.from, prev.to]) : null,
-          groupBy === "none" ? [] : counts(DIMENSIONS[groupBy].sql, DIMENSIONS[groupBy].products),
+          groupBy === "none" ? [] : counts(splitColumn(groupBy).sql, splitColumn(groupBy).products),
           // Per period: customers whose first-ever order falls in it, and those who had one before it.
           query(
             `SELECT ${periodExpr(series.interval, "o.placed_at")} AS period,
@@ -1290,11 +1352,12 @@ const tools = {
   ),
 
   get_promotions_performance: dataTool(
-    "Promotion performance: promo_orders (orders that used a promo code), promo_order_share_pct (their share of all orders), discount_amount given (USD), promo_net_sales (net sales of those orders) and discount_share_pct (discount as a share of those orders' pre-discount revenue) for the whole range, previous {promo_orders, discount_amount, promo_net_sales} for the range just before (null when it starts before the data), over_time (promo_orders and discount_amount per period: days, weeks or months, whichever fits the range), and rows split by group_by: code (each promo code, the default), region, category, brand or channel, each with name, orders, discount_amount, net_sales and discount_share_pct, sorted by discount amount. Follows the range, region, category, brand and channel filters.",
-    z.object({
-      group_by: z.enum(["code", ...FILTER_NAMES]).default("code"),
-      ...frame,
-    }),
+    "Promotion performance: promo_orders (orders that used a promo code), promo_order_share_pct (their share of all orders), discount_amount given (USD), promo_net_sales (net sales of those orders) and discount_share_pct (discount as a share of those orders' pre-discount revenue) for the whole range, previous {promo_orders, discount_amount, promo_net_sales} for the range just before (null when it starts before the data), over_time (promo_orders and discount_amount per period: days, weeks or months, whichever fits the range), and rows split by group_by: code (each promo code, the default) or a filter's name, each with name, orders, discount_amount, net_sales and discount_share_pct, sorted by discount amount. Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        group_by: splitParam(["code"], "code"),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -1327,10 +1390,10 @@ const tools = {
       const ranged = await withRange(args);
       const { from, to } = await dateRange(ranged);
       const series = modern(args) ? await overTime(ranged, from, to) : null;
-      const groupBy = oneOf(args.group_by, ["code", ...FILTER_NAMES], "code");
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["code"], "code");
       const prev = previousRange(from, to);
       const comparable = prev.from >= (await dataDays()).first;
-      const slice = readSlice(args);
       return run("promotions", { from, to, groupBy, series, ...slice }, async () => {
         const filter = sliceWhere(slice, 3);
         const params = [from, to, ...filter.params];
@@ -1397,7 +1460,7 @@ const tools = {
         const [rows, all, before, orders, periods] = await Promise.all([
           groupBy === "code"
             ? promos("pr.code", false, true)
-            : promos(DIMENSIONS[groupBy].sql, DIMENSIONS[groupBy].products, false),
+            : promos(splitColumn(groupBy).sql, splitColumn(groupBy).products, false),
           promos("'All'", false, false),
           comparable ? promos("'All'", false, false, [prev.from, prev.to]) : null,
           query(
@@ -1480,7 +1543,12 @@ export const salesTools = Object.fromEntries(
   Object.entries(tools).map(([name, tool]) => [
     name,
     {
-      ...tool,
+      description: tool.description,
+      output: tool.output,
+      // Read from the tool each time, not copied: its choices follow the data (tool.ts).
+      get parameters() {
+        return tool.parameters;
+      },
       execute: async (...call: Parameters<typeof tool.execute>) => {
         const result = await tool.execute(...call);
         return text((call[0] as Record<string, unknown> | undefined)?.range)
@@ -1490,3 +1558,13 @@ export const salesTools = Object.fromEntries(
     },
   ]),
 ) as typeof tools;
+
+/**
+ * Arguments a call takes but can't follow, given its other arguments. Targets are set per region
+ * or per category, never for a category within a region, so a call by region can't be narrowed to
+ * a category, nor one by category to a region.
+ */
+export const ignoredArguments: Record<string, (args: Record<string, unknown>) => string[]> = {
+  get_targets_vs_actuals: ({ scope }) =>
+    scope === "region" ? ["category"] : scope === "category" ? ["region"] : [],
+};
