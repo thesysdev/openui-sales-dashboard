@@ -1,11 +1,11 @@
-import { dateFilter, dimensionFilter, filterArgs } from "./filter-bar";
+import { dateFilter, dimensionFilter, filterArgs } from "../filter-bar";
 
-// Examples for the builder, written with this app's own data tools in place of the dashboard
-// library's generic ones (which query SQL by hand and write numbers in). They are short on
-// purpose: each shows how this data is wired (filters passed into every Query that can follow
-// them, previous values, a series per group, a card's own switch) and not what a dashboard should
-// look like. Neither answers a request the home page can make, so there is no dashboard to copy:
-// what one shows, and which filters it has, is the builder's choice.
+// Examples for the builder, written with this data's own tools in place of the dashboard
+// library's generic ones (which query SQL by hand and write numbers in). They belong to the
+// dataset: another dataset brings its own, or none. They are short on purpose: each shows how
+// this data is wired (filters passed into every Query that can follow them, previous values, a
+// series per group, a card's own switch) and not what a dashboard should look like. Neither
+// answers a request the home page can make, so there is no dashboard to copy.
 
 /** Filters into Queries, headline numbers with what came before, one series per group. */
 const SALES_OVER_TIME = `root = Dashboard([filters, lead, trend])

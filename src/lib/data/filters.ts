@@ -54,6 +54,8 @@ export const RANGES = [
 ] as const;
 
 export type RangeValue = (typeof RANGES)[number]["value"];
+/** The range a dashboard opens on when the request names none. */
+export const DEFAULT_RANGE: RangeValue = "3m";
 export const RANGE_VALUES = RANGES.map((range) => range.value) as [RangeValue, ...RangeValue[]];
 
 /** "organic_search" → "Organic search", for a filter option's label. */
