@@ -306,7 +306,7 @@ function PlaceholderGrid() {
       <Notch
         show={running}
         icon={<CircleNotch className="size-3 animate-spin motion-reduce:animate-none" />}
-        label="Fetching live data…"
+        label="Starting…"
       />
       <ShaderBackdrop />
     </div>
