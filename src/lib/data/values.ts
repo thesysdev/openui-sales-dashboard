@@ -45,8 +45,9 @@ export type Found = {
   /** The periods the date filter offers, and the one a dashboard opens on by default. */
   ranges: { value: string; label: string }[];
   opens: string;
-  /** The first day with orders, "2024-11-03". */
+  /** The first and last days with orders, "2024-11-03". */
   first: string;
+  last: string;
 };
 
 /** The tables a join reads, by the alias each goes under: {o: "orders", p: "products"}. */
@@ -134,8 +135,10 @@ export const found = (): Promise<Found> =>
         value: `${length}m`,
         label: length === 1 ? "Last month" : `Last ${length} months`,
       }));
+    // The year so far, when the data reaches back to its start.
+    if (first <= `${last.slice(0, 4)}-01-01`) ranges.push({ value: "ytd", label: "Year to date" });
     ranges.push({ value: "lifetime", label: "Lifetime" });
-    latest = {
+    return {
       filters: filters
         .flatMap((filter) => (filter ? [filter] : []))
         // One filter per name.
@@ -143,8 +146,12 @@ export const found = (): Promise<Found> =>
       ranges,
       opens: ranges.some(({ value }) => value === "3m") ? "3m" : ranges[0]!.value,
       first,
-    };
-    return latest;
+      last,
+    } satisfies Found;
+  }).then((data) => {
+    // Kept on every read, cached or not, for foundFilters.
+    latest = data;
+    return data;
   });
 
 let latest: Found | undefined;

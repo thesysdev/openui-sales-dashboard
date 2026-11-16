@@ -993,13 +993,26 @@ const tools = {
       // months from its start to there (a range ending earlier still ends at the last whole month).
       const ranged = await withRange(args);
       const start = /^\d{4}-\d{2}-\d{2}$/.test(text(ranged.from)) ? text(ranged.from) : "";
+      // A range that ends earlier, such as exact dates, ends at the last whole month in it, or,
+      // when it is shorter than a month, at the end of the month it ends in.
+      const to = /^\d{4}-\d{2}-\d{2}$/.test(text(ranged.to)) ? text(ranged.to) : "";
+      const monthDay = (day: string, shift: number) =>
+        new Date(Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) + shift, 0))
+          .toISOString()
+          .slice(0, 10);
+      const end =
+        !to || to >= monthEnd
+          ? monthEnd
+          : monthDay(to, 0) === to || monthDay(to, -1) < (start || to)
+            ? monthDay(to, 0)
+            : monthDay(to, -1);
       const months = start
         ? Math.min(
             24,
             Math.max(
               1,
-              (Number(monthEnd.slice(0, 4)) - Number(start.slice(0, 4))) * 12 +
-                Number(monthEnd.slice(5, 7)) -
+              (Number(end.slice(0, 4)) - Number(start.slice(0, 4))) * 12 +
+                Number(end.slice(5, 7)) -
                 Number(start.slice(5, 7)) +
                 1,
             ),
@@ -1007,7 +1020,7 @@ const tools = {
         : int(ranged.months, 6, 1, 24);
       // The same number of months just before, when the data reaches that far back.
       const firstMonth = new Date(
-        Date.UTC(Number(monthEnd.slice(0, 4)), Number(monthEnd.slice(5, 7)) - months, 1),
+        Date.UTC(Number(end.slice(0, 4)), Number(end.slice(5, 7)) - months, 1),
       );
       const before = new Date(firstMonth.getTime() - 86_400_000).toISOString().slice(0, 10);
       const beforeStart = new Date(
@@ -1048,7 +1061,7 @@ const tools = {
         for (const row of list) map.set(key(row), [...(map.get(key(row)) ?? []), row]);
         return [...map];
       };
-      return run("targets", { scope, months, span, monthEnd, only }, async () => {
+      return run("targets", { scope, months, span, end, only }, async () => {
         const dim = {
           business: "'ALL'",
           region: "o.shipping_region",
@@ -1110,7 +1123,7 @@ const tools = {
             });
         };
         const [trend, earlier] = await Promise.all([
-          load(monthEnd, span),
+          load(end, span),
           comparable ? load(before, months) : null,
         ]);
         // The headline and each scope count the range's own months; the trend may start earlier.

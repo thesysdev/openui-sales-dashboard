@@ -17,18 +17,20 @@ const held = (found?: Found) =>
 
 The filters the data has now, each by its name, with the column it reads and its values spelled as a filter takes them:
 ${found.filters.map(({ name, column, values }) => `- ${name} (${column}): ${values.join(", ")}`).join("\n")}
-The periods a dashboard can open on: ${found.ranges.map(({ value, label }) => `"${value}" ${label.toLowerCase()}`).join(", ")}. It opens on "${found.opens}" when the request names none.`
+The periods a dashboard can open on: ${found.ranges.map(({ value, label }) => `"${value}" ${label.toLowerCase()}`).join(", ")}. It opens on "${found.opens}" when the request names none, and on the closest of these when it names another.`
     : "";
 
 /** Where the data starts, as the database has it: "from November 2024 ". */
 const since = (found?: Found) => (found ? `from ${firstMonth(found)} ` : "");
+/** The last day with orders, for exact dates counted back from it: " (2026-11-13)". */
+const until = (found?: Found) => (found ? ` (${found.last})` : "");
 
 /** The chat's instructions, with the filters, values and periods found in the database when it answered. */
 export const chatPrompt = (
   found?: Found,
 ) => `You are the sales analytics copilot for Northstar, a multi-brand apparel, footwear and accessories retailer. You build live dashboards from its sales database and answer in plain text; dashboards are artifacts the user opens beside the chat.
 
-The data: orders ${since(found)}to the latest order, in USD. "Last month", "the last 6 months" and other relative ranges count back from the last day with orders, so describe them as months back rather than exact dates. Monthly series and targets end at the last whole month, so they never close on a partial month. Net sales means revenue after discounts and before refunds; cancelled orders, test orders, and internal customers are always excluded. Dashboards can show sales, targets vs actuals, returns, customers, and promotions.${held(found)}
+The data: orders ${since(found)}to the latest order${until(found)}, in USD. "Last month", "the last 6 months" and other relative ranges count back from the last day with orders, so describe them as months back rather than exact dates. Monthly series and targets end at the last whole month, so they never close on a partial month. Net sales means revenue after discounts and before refunds; cancelled orders, test orders, and internal customers are always excluded. Dashboards can show sales, targets vs actuals, returns, customers, and promotions.${held(found)}
 
 Dashboards load their own data from these tools every time they are opened:
 ${data}

@@ -45,7 +45,7 @@ export default defineToolkit({
         .string()
         .optional()
         .describe(
-          "The period the dashboard opens on, which the reader can change: one of the periods your instructions list, by its value. Leave out when the request names none.",
+          'The period the dashboard opens on, which the reader can change: one of the periods your instructions list, by its value, or exact dates as "YYYY-MM-DD..YYYY-MM-DD" for a request that names them, such as a calendar year or month. Leave out when the request names none.',
         ),
       filters: z
         .array(filter)

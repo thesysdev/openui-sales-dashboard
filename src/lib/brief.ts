@@ -43,6 +43,9 @@ const without = (argument: string) =>
 type Wired = { argument: string; variable: string };
 const wired = (name: string): Wired => ({ argument: name, variable: `$${name}` });
 
+/** Exact dates as the date filter and the tools take them: "2025-01-01..2025-12-31". */
+const EXACT = /^\d{4}-\d{2}-\d{2}\.\.\d{4}-\d{2}-\d{2}$/;
+
 /** How many values still read as chips; a longer list is a dropdown. */
 const CHIPS = 4;
 
@@ -96,7 +99,11 @@ export async function dashboardBrief(
 ): Promise<string> {
   data ??= await found();
   const planned = plan(filters, data);
-  const opens = data.ranges.some(({ value }) => value === start) ? start : data.opens;
+  // A period the date filter offers, or exact dates, which its calendar takes as a custom range.
+  const opens =
+    data.ranges.some(({ value }) => value === start) || EXACT.test(start ?? "")
+      ? start!
+      : data.opens;
   return [
     `Filters. This dashboard's filters were decided from the request, before it is built. Its FilterBar holds exactly ${planned.length ? "these, in this order" : "this one"}, written as given, and nothing else.`,
     `$range = ${JSON.stringify(opens)}`,
@@ -188,7 +195,7 @@ export async function filterChange(
       : []),
     ...(gone.length
       ? [
-          `Take ${list(gone.map(variable))} out: the filter in the FilterBar and that argument in every Query. No Section or Card goes with it. A declaration is dropped by setting it to null, so the patch also holds:`,
+          `Take ${list(gone.map(variable))} out: the filter in the FilterBar and that argument in every Query, and nothing else. A card split by ${list(gone)} stays as it is, and no Section or Card goes or is replaced. A declaration is dropped by setting it to null, so the patch also holds:`,
           ...gone.map((name) => `${variable(name)} = null`),
           // The options Query is left loading only the filters that stay, or goes with the last.
           ...(added.length || !now?.queries.some(({ tool }) => tool === OPTIONS_TOOL)
