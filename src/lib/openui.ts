@@ -2,8 +2,7 @@ import { promptOptions } from "@openuidev/dashboard-library";
 import { OpenUIClient } from "@openuidev/server";
 import spec from "../generated/spec.json";
 import { dataTools } from "./data";
-import { builderAbout } from "./data/about";
-import { examples } from "./data/examples";
+import { examples } from "./examples";
 import { currentVisitor } from "./visitor";
 
 // OpenUI Cloud, or your own deployment of it, such as a local stack at http://localhost:3102.
@@ -24,8 +23,8 @@ export function userId(): string {
 }
 
 // One definition for every dashboard: the components it's built from, the model that builds
-// it, and where its data comes from: the data tools in ./data. Its interpreter runs those tools
-// for the browser.
+// it, and where its data comes from: our sales data tools over the Neon database. Its
+// interpreter runs those tools for the browser.
 export const dashboards = openui.defineDashboard({
   // The specification `npm run generate` writes from src/library.ts, so the server never loads
   // the React components the browser renders with.
@@ -34,10 +33,10 @@ export const dashboards = openui.defineDashboard({
   tools: dataTools,
   // The kit's rules, with our own preamble and examples.
   promptOptions: {
-    // Whose data it is, from the dataset, then what holds for a dashboard over any data.
-    preamble: `${builderAbout} Every number is loaded by Query() each time the dashboard opens, so none is written in: no sample data, no target or threshold a tool doesn't return. The request says what the reader wants to learn; the design is yours. Use the whole component library to make the answer clear at a glance, add what else the data tools hold that helps read it, and follow with the detail. A chart's labels and values are columns read off a list (rows.period, rows.value), never the list of rows itself.`,
-    // The dataset's own, in place of the kit's generic ones. They show how the data is wired,
-    // not what a dashboard looks like.
+    preamble:
+      "You build sales dashboards for Northstar, a multi-brand apparel, footwear and accessories retailer. All data is live from its Postgres sales database, in USD. Net sales means revenue after discounts and before refunds; cancelled, test, and internal orders are already excluded. Every number is loaded by Query() each time the dashboard opens, so none is written in: no sample data, no target or threshold a tool doesn't return. The request says what the reader wants to learn; the design is yours. Use the whole component library to make the answer clear at a glance, add what else the data tools hold that helps read it, and follow with the detail.",
+    // Ours, written with the sales tools, in place of the kit's generic ones. They show how the
+    // data is wired, not what a dashboard looks like.
     examples,
     additionalRules: promptOptions.additionalRules,
   },

@@ -1092,9 +1092,6 @@ const tools = {
         };
       });
     },
-    // Targets have no region × category level: a call split by region can't narrow to a
-    // category, nor one split by category to a region.
-    { category: { scope: ["region"] }, region: { scope: ["category"] } },
   ),
 
   get_customer_insights: dataTool(

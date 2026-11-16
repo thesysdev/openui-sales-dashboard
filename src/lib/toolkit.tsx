@@ -5,7 +5,6 @@ import { z } from "zod";
 import { DashboardCard } from "../components/dashboard";
 import { dashboardBrief, filterChange } from "./brief";
 import { readDashboard } from "./program";
-import { chatCases } from "./data/about";
 import { DEFAULT_RANGE, FILTERS, FILTER_NAMES, RANGES, RANGE_VALUES } from "./data/filters";
 import { baseUrl, dashboards, openui, userId } from "./openui";
 
@@ -17,7 +16,7 @@ const filter = z.object({
     .string()
     .optional()
     .describe(
-      `The value it opens on, when the request narrows to one: ${FILTER_NAMES.map((name) => `${name} is one of ${FILTERS[name].values.join(", ")}`).join("; ")}. Leave out to open on all, or pass "" to set a filter back to all.`,
+      `The value it opens on, when the request narrows to one: ${FILTER_NAMES.map((name) => `${name} is one of ${FILTERS[name].values.join(", ")}`).join("; ")}. Leave out to open on all.`,
     ),
 });
 
@@ -34,7 +33,7 @@ export default defineToolkit({
       title: z
         .string()
         .min(1)
-        .describe(`A short title without the period, such as ${JSON.stringify(chatCases.title)}.`),
+        .describe('A short title without the period, such as "Net sales by region".'),
       prompt: z
         .string()
         .min(1)

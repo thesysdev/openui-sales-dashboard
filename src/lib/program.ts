@@ -3,20 +3,13 @@ import { dataTools } from "./data";
 import { FILTERS } from "./data/filters";
 
 // Reads a dashboard's program, with the parser the renderer uses, for a change to it: which
-// filters its FilterBar has and which tool each Query calls. It knows the data only by its tools'
-// argument names and its filter list, so it holds for any dataset in ./data.
+// filters its FilterBar has, by the variables it gave them. It knows the data only by its tools'
+// argument names and its filter list.
 
-/**
- * A tool can take an argument that some of its calls don't follow. Its dataset says so on the
- * tool, beside its parameters: the argument, then the other argument and the values of it that
- * switch the first off. `{ a: { mode: ["x"] } }` reads "a call with mode x doesn't follow a".
- */
-export type Ignores = Record<string, Record<string, readonly string[]>>;
-
-/** What is known of the data: each tool's arguments, and each filter's label for all. */
+/** What is known of the data: each tool's arguments, and the filters by name. */
 export type Dataset = {
-  tools: Record<string, { takes: readonly string[]; ignores?: Ignores }>;
-  filters: Record<string, { all: string }>;
+  tools: Record<string, { takes: readonly string[] }>;
+  filters: Record<string, unknown>;
 };
 
 /** The dataset in ./data. */
@@ -24,10 +17,7 @@ export const dataset: Dataset = {
   tools: Object.fromEntries(
     Object.entries(dataTools).map(([name, tool]) => [
       name,
-      {
-        takes: Object.keys((tool.parameters as { properties?: object }).properties ?? {}),
-        ignores: (tool as { ignores?: Ignores }).ignores,
-      },
+      { takes: Object.keys((tool.parameters as { properties?: object }).properties ?? {}) },
     ]),
   ),
   filters: FILTERS,
@@ -89,8 +79,6 @@ export type Current = {
    * as ("" for a control no Query passes, such as a switch read on the page).
    */
   bar: { variable: string; argument: string }[];
-  /** Each Query's name and the tool it calls. */
-  queries: { name: string; tool: string }[];
 };
 
 /**
@@ -107,18 +95,11 @@ export function readDashboard(program: string, data: Dataset = dataset): Current
     return resolve(all.get(node.n), seen.add(node.n));
   };
 
-  /** A Query's tool and arguments, when both are written out. */
-  const call = (name: string) => {
-    const query = all.get(name);
-    if (!isComp(query, QUERY)) return null;
-    const tool = resolve(query.args[0]);
-    const args = resolve(query.args[1]);
-    if (tool?.k !== "Str" || (args && args.k !== "Obj")) return null;
-    return { tool: tool.v, args: new Map(args?.k === "Obj" ? args.entries : []) };
-  };
-  const queries = [...all.keys()].flatMap((name) => {
-    const query = call(name);
-    return query ? [{ name, ...query }] : [];
+  /** The arguments each Query writes out, by name. */
+  const passes = [...all.values()].flatMap((statement) => {
+    if (!isComp(statement, QUERY)) return [];
+    const args = resolve(statement.args[1]);
+    return args?.k === "Obj" ? args.entries : [];
   });
 
   // The FilterBar that is shown: the first one the root reaches.
@@ -152,17 +133,16 @@ export function readDashboard(program: string, data: Dataset = dataset): Current
     Object.values(data.tools).some((tool) => tool.takes.includes(argument));
   return {
     bar: variables.map((variable) => {
-      const passed = queries.flatMap((query) =>
-        [...query.args].flatMap(([argument, value]) =>
-          value.k === "StateRef" && value.n === variable ? [argument] : [],
-        ),
+      const passed = passes.flatMap(([argument, value]) =>
+        value.k === "StateRef" && value.n === variable ? [argument] : [],
       );
       const named = variable.slice(1);
       // A filter is passed as the argument it narrows; unpassed, it is the one of its name.
       const argument =
-        passed.find((name) => name in data.filters) ?? passed[0] ?? (known(named) ? named : "");
+        passed.find((name) => Object.hasOwn(data.filters, name)) ??
+        passed[0] ??
+        (known(named) ? named : "");
       return { variable, argument };
     }),
-    queries: queries.map(({ name, tool }) => ({ name, tool })),
   };
 }

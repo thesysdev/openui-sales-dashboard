@@ -85,10 +85,10 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 | `src/lib/visitor.ts`, `src/proxy.ts` | Each browser's anonymous visitor id, which owns its dashboards |
 | `src/lib/base-path.ts` | The base path, for hand-written URLs |
 | `src/lib/toolkit.tsx` | `create_dashboard` and `edit_dashboard`: schema, `execute`, `render` |
-| `src/lib/data/about.ts`, `examples.ts` | The dataset in words, and short examples of how its data is wired |
 | `src/lib/brief.ts`, `filter-bar.ts` | The filter plan `create_dashboard` hands the builder: each planned filter written out, and which queries pass it, worked out from the data tools' arguments |
-| `src/lib/program.ts` | Reads a dashboard's program for an edit: the filters it has and the tools its queries call |
-| `src/lib/prompt.ts` | Chat instructions: rules that hold for any dataset, around the dataset's own description |
+| `src/lib/examples.ts` | Short examples for the builder of how the data is wired |
+| `src/lib/program.ts` | Reads a dashboard's program for an edit: the filters its filter bar has |
+| `src/lib/prompt.ts` | Chat instructions and the data dashboards can show |
 | `src/app/page.tsx`, `src/components/home-sentence.tsx` | Home page and the sentence builder |
 | `src/components/app.tsx` | Runtime, providers, and the three-pane layout |
 | `src/components/dashboard.tsx` | Chat card, dashboard panel and status notch |
@@ -99,16 +99,6 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 | `src/app/api/followups/route.ts` | Follow-up suggestions |
 
 `npm run generate` builds the component spec in `src/generated/` (ignored) before `dev` and `build`.
-
-## Use another dataset
-
-Everything the app says about the data is in `src/lib/data`: the tools dashboards load from, the filters they can be narrowed by (`filters.ts`), a description of the data (`about.ts`) and optional examples (`examples.ts`). The rules for building a dashboard name nothing in that folder. To build dashboards over other data, replace the folder and keep the rest:
-
-- Export `dataTools`, each with a description, its arguments and a sample result.
-- List the filters and date presets in `filters.ts`. A tool follows a filter when it takes an argument of that name; the plan for each dashboard is worked out from that. The date filter's argument is always named `range`: a tool that follows the date takes `range`.
-- Describe the data in `about.ts`. `examples.ts` can export an empty list.
-
-The home page's sentence (`src/components/home-sentence.tsx`) and the connected-data popup are specific to the sales data and need their own changes.
 
 ## Before deploying
 
