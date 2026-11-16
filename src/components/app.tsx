@@ -217,7 +217,11 @@ function AgentView({ hidden, onShowData }: { hidden: boolean; onShowData: () => 
               className="h-full animate-in fade-in slide-in-from-right-4 duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]"
             >
               <DashboardPanel
-                {...("id" in open ? { id: open.id } : { response: open.response })}
+                {...("id" in open
+                  ? { id: open.id }
+                  : "response" in open
+                    ? { response: open.response }
+                    : { pending: true })}
                 edit={open.edit}
               />
             </div>
