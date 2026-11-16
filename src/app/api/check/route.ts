@@ -9,17 +9,20 @@ export const runtime = "nodejs";
 
 // Checks a dashboard's filters once a version of it is whole (src/lib/check.ts), and repairs it
 // when a filter or a switch changes nothing: the problems go to the builder as one exact edit.
-// The browser calls this each time a dashboard settles; the program comes from OpenUI Cloud.
+// The browser calls this when a version made while the user watches settles; the program comes
+// from OpenUI Cloud.
 
-// The request is a dashboard's id and a flag. A repair is a full generation on the API key and
-// the route needs no sign-in, so a bigger body is refused.
+// The request is a dashboard's id. A repair is a full generation on the API key and the route
+// needs no sign-in, so a bigger body is refused.
 const MAX_BODY = 1_000;
 
 // One repair for each version the user or the chat made, and none for a version a repair made.
-// So for each dashboard this keeps the version that was repaired and the version the repair
-// made, and neither is repaired again. It is this server's memory only, so the browser also
-// says when the version it shows came from a repair. Kept on globalThis because Next.js dev
-// gives a recompiled route a new module instance.
+// So for each dashboard this keeps the version being repaired and the version the repair makes,
+// and neither is repaired again. The record is written before the repair is started, so requests
+// that arrive together start one. It is this server's memory only: run on several instances, each
+// keeps its own, and a shared store is needed for the limit to hold across them (see the README's
+// notes on deploying). Kept on globalThis because Next.js dev gives a recompiled route a new
+// module instance.
 type Repair = { from: string; made?: string };
 const repairs = ((globalThis as Record<string, unknown>).__filterRepairs ??= new Map()) as Map<
   string,
@@ -27,15 +30,16 @@ const repairs = ((globalThis as Record<string, unknown>).__filterRepairs ??= new
 >;
 const MAX_REPAIRS = 2_000;
 
-// Only a version made just now is repaired. Opening an older dashboard checks it and changes
-// nothing: its owner didn't ask for it to change.
+// Only a version made just now is repaired. An older dashboard is checked and left as it is:
+// its owner didn't ask for it to change. The age is taken either way round, so a clock that
+// runs behind OpenUI Cloud's doesn't make every dashboard look new.
 const FRESH_MS = 10 * 60_000;
 
 export async function POST(request: NextRequest) {
   const visitor = readVisitorId(request);
   if (!visitor) return noVisitor();
   const raw = await request.text();
-  let body: { id?: unknown; repaired?: unknown } = {};
+  let body: { id?: unknown } = {};
   try {
     if (raw.length <= MAX_BODY) body = JSON.parse(raw) ?? {};
   } catch {
@@ -69,38 +73,47 @@ export async function POST(request: NextRequest) {
   // always shows one region"), and the card says which value it shows, so it is reported and
   // left as it is. What is repaired is a card that silently ignores a filter, a control that
   // changes nothing, and a card that can't follow a filter without saying so.
-  const found = checkProgram(program);
+  let found: ReturnType<typeof checkProgram>;
+  try {
+    found = checkProgram(program);
+  } catch {
+    // A program the check can't follow, such as statements that name each other in a circle.
+    return Response.json({ problems: [] });
+  }
   const problems = found.filter((problem) => problem.kind !== "fixed");
   const fixes = problems.map((problem) => problem.fix);
   if (!problems.length) return Response.json({ problems: found.map((problem) => problem.fix) });
   const fresh =
-    typeof artifact.updated_at === "number" && Date.now() - artifact.updated_at * 1000 < FRESH_MS;
+    typeof artifact.updated_at === "number" &&
+    Math.abs(Date.now() - artifact.updated_at * 1000) < FRESH_MS;
 
   // The version, or without one the program itself, so a changed program is a new version.
   const version = typeof artifact.version === "string" ? artifact.version : program;
-  const repair = repairs.get(id);
-  // The first new version after a repair whose version wasn't told is the one it made.
-  if (repair && !repair.made && version !== repair.from) repair.made = version;
-  if (!fresh || body.repaired === true || version === repair?.from || version === repair?.made) {
-    if (fresh && version !== repair?.from) {
-      console.warn(`Dashboard ${id} still fails its check`, fixes);
-    }
+  const before = repairs.get(id);
+  // The first new version after a repair whose version isn't known yet is the one it made.
+  if (before && !before.made && version !== before.from) before.made = version;
+  if (!fresh || version === before?.from || version === before?.made) {
     return Response.json({ problems: fixes });
   }
 
+  // Recorded before the repair starts: a request that arrives meanwhile finds it and stops.
+  const repair: Repair = { from: version };
+  repairs.delete(id);
+  repairs.set(id, repair);
+  if (repairs.size > MAX_REPAIRS) repairs.delete(repairs.keys().next().value!);
   try {
+    // Not tied to the request: the browser leaving shouldn't stop a repair it can't see ended.
     const started = await dashboards.edit(
       { id, prompt: repairPrompt(problems) },
       { userId: visitor },
-      { signal: request.signal },
     );
     // Its response names the version it makes.
-    repairs.delete(id);
-    repairs.set(id, { from: version, made: parseMessage(started).attributes.version });
-    if (repairs.size > MAX_REPAIRS) repairs.delete(repairs.keys().next().value!);
+    repair.made ??= parseMessage(started).attributes.version;
     // The renderer takes the response as is, as it does an edit_dashboard result.
     return Response.json({ problems: fixes, repair: started });
   } catch (error) {
+    // Nothing was started, so this version can be tried again.
+    if (repairs.get(id) === repair) repairs.delete(id);
     const status = error instanceof OpenUIApiError ? (error.status ?? 500) : 500;
     return Response.json({ error: "OpenUI Cloud could not start the repair." }, { status });
   }

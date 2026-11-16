@@ -97,11 +97,10 @@ function children(node: ASTNode): ASTNode[] {
   }
 }
 
-/** The program's statements by name. A program stored twice over is read once. */
+/** The program's statements by name. A name written twice keeps its last statement, as drawn. */
 function statements(program: string): Map<string, ASTNode> {
   const found = new Map<string, ASTNode>();
   for (const statement of split(tokenize(parseMessage(program).content))) {
-    if (found.has(statement.id)) continue;
     try {
       found.set(statement.id, parseExpression(statement.tokens));
     } catch {
@@ -111,11 +110,19 @@ function statements(program: string): Map<string, ASTNode> {
   return found;
 }
 
-/** The problems in a dashboard's program: none when every control changes what it sits over. */
-export function checkProgram(program: string, data: Dataset = dataset): Problem[] {
+/**
+ * A dashboard's program as written: its statements, each Query's tool and arguments, the
+ * FilterBar that is shown and the Cards that are drawn. The check and the plan for an edit both
+ * read a dashboard through this.
+ */
+function parse(program: string) {
   const all = statements(program);
-  const resolve = (node: ASTNode | undefined): ASTNode | undefined =>
-    node?.k === "Ref" && all.has(node.n) ? resolve(all.get(node.n)) : node;
+  // Follows a name to the statement it stands for. Names that lead back to themselves end where
+  // the circle closes.
+  const resolve = (node: ASTNode | undefined, seen = new Set<string>()): ASTNode | undefined => {
+    if (node?.k !== "Ref" || !all.has(node.n) || seen.has(node.n)) return node;
+    return resolve(all.get(node.n), seen.add(node.n));
+  };
 
   /** A Query's tool and arguments, when both are written out. */
   const call = (name: string) => {
@@ -127,9 +134,101 @@ export function checkProgram(program: string, data: Dataset = dataset): Problem[
     return { tool: tool.v, args: new Map(args?.k === "Obj" ? args.entries : []) };
   };
 
+  /** The controls in a FilterBar's or a Card's list, each with the variable it sets. */
+  const controls = (list: ASTNode | undefined): Control[] => {
+    const items = resolve(list);
+    return (items?.k === "Arr" ? items.els : []).flatMap((item) => {
+      const control = resolve(item);
+      if (control?.k !== "Comp") return [];
+      const first = control.args[0];
+      // CompareToggle takes its variable later, and only with options.
+      const bound =
+        control.name === NEEDS_NO_VARIABLE
+          ? control.args.find((arg) => arg.k === "StateRef")
+          : first?.k === "StateRef"
+            ? first
+            : undefined;
+      return [{ name: control.name, variable: bound?.k === "StateRef" ? bound.n : null }];
+    });
+  };
+
+  /** The arguments a variable is passed as, in any Query. */
+  const passedAs = (variable: string) => {
+    const found = new Set<string>();
+    for (const name of all.keys()) {
+      for (const [argument, value] of call(name)?.args ?? []) {
+        if (value.k === "StateRef" && value.n === variable) found.add(argument);
+      }
+    }
+    return found;
+  };
+
+  // What is drawn: everything the root reaches. The first FilterBar is the one shown.
+  const cards: Comp[] = [];
+  let bar: Comp | undefined;
+  const seen = new Set<string>();
+  const find = (node: ASTNode | undefined) => {
+    if (!node) return;
+    if (node.k === "Ref") {
+      if (!all.has(node.n) || seen.has(node.n)) return;
+      seen.add(node.n);
+      return find(all.get(node.n));
+    }
+    if (isComp(node, BAR)) bar ??= node;
+    if (isComp(node, CARD)) cards.push(node);
+    children(node).forEach(find);
+  };
+  const root: ASTNode = { k: "Ref", n: all.has("root") ? "root" : ([...all.keys()][0] ?? "") };
+  find(root);
+  return { all, resolve, call, controls, passedAs, cards, bar: bar as Comp | undefined, root };
+}
+
+/** What a change to a dashboard has to know of it. */
+export type Current = {
+  /**
+   * The FilterBar's controls, in order: the variable each sets, and the argument Queries pass it
+   * as ("" for a control no Query passes, such as a switch read on the page).
+   */
+  bar: { variable: string; argument: string }[];
+  /** Each Query's name and the tool it calls. */
+  queries: { name: string; tool: string }[];
+};
+
+/**
+ * Reads a dashboard for a change to it. Nothing comes back for a program that isn't whole yet:
+ * one still being written may not have reached its FilterBar.
+ */
+export function readDashboard(program: string, data: Dataset = dataset): Current | undefined {
+  if (!parseMessage(program).end) return undefined;
+  const { all, call, controls, passedAs, bar } = parse(program);
+  const known = (argument: string) =>
+    Object.values(data.tools).some((tool) => tool.takes.includes(argument));
+  return {
+    bar: controls(bar?.args[0]).flatMap(({ variable }) => {
+      if (!variable) return [];
+      const passed = [...passedAs(variable)];
+      const named = variable.slice(1);
+      // A filter is passed as the argument it narrows; unpassed, it is the one of its name.
+      const argument =
+        passed.find((name) => name in data.filters) ?? passed[0] ?? (known(named) ? named : "");
+      return [{ variable, argument }];
+    }),
+    queries: [...all.keys()].flatMap((name) => {
+      const query = call(name);
+      return query ? [{ name, tool: query.tool }] : [];
+    }),
+  };
+}
+
+/** The problems in a dashboard's program: none when every control changes what it sits over. */
+export function checkProgram(program: string, data: Dataset = dataset): Problem[] {
+  const { all, resolve, call, controls, passedAs, cards, bar, root } = parse(program);
+  /** A data tool by its own name: a Query may name anything, a script included. */
+  const toolOf = (name: string) => (Object.hasOwn(data.tools, name) ? data.tools[name] : undefined);
+
   /** Whether this call doesn't follow an argument its tool takes. */
   const ignores = (query: NonNullable<ReturnType<typeof call>>, argument: string) =>
-    Object.entries(data.tools[query.tool]?.ignores?.[argument] ?? {}).some(([other, values]) => {
+    Object.entries(toolOf(query.tool)?.ignores?.[argument] ?? {}).some(([other, values]) => {
       const value = resolve(query.args.get(other));
       return value?.k === "Str" && values.includes(value.v);
     });
@@ -154,7 +253,11 @@ export function checkProgram(program: string, data: Dataset = dataset): Problem[
         const query = call(node.n);
         if (isComp(statement, QUERY)) named.queries.add(node.n);
         if (query) {
+          // A Query changes with an argument only if its tool takes it and this call follows it.
+          // A tool the data doesn't have (a script) is taken at its word.
+          const takes = toolOf(query.tool)?.takes;
           for (const [argument, value] of query.args) {
+            if (takes && !takes.includes(argument)) continue;
             if (!ignores(query, argument)) reads(value, named);
           }
         } else {
@@ -169,24 +272,6 @@ export function checkProgram(program: string, data: Dataset = dataset): Problem[
     return into;
   };
 
-  /** The controls in a FilterBar's or a Card's list, each with the variable it sets. */
-  const controls = (list: ASTNode | undefined): Control[] => {
-    const items = resolve(list);
-    return (items?.k === "Arr" ? items.els : []).flatMap((item) => {
-      const control = resolve(item);
-      if (control?.k !== "Comp") return [];
-      const first = control.args[0];
-      // CompareToggle takes its variable later, and only with options.
-      const bound =
-        control.name === NEEDS_NO_VARIABLE
-          ? control.args.find((arg) => arg.k === "StateRef")
-          : first?.k === "StateRef"
-            ? first
-            : undefined;
-      return [{ name: control.name, variable: bound?.k === "StateRef" ? bound.n : null }];
-    });
-  };
-
   /** The words written in a value, such as a card's subtitle. */
   const words = (node: ASTNode | undefined): string => {
     const value = resolve(node);
@@ -194,27 +279,10 @@ export function checkProgram(program: string, data: Dataset = dataset): Problem[
     return value.k === "Str" ? value.v : children(value).map(words).join(" ");
   };
 
-  // What is drawn: everything the root reaches. The first FilterBar is the one shown.
-  const cards: Comp[] = [];
-  let bar: Comp | undefined;
-  const seen = new Set<string>();
-  const find = (node: ASTNode | undefined) => {
-    if (!node) return;
-    if (node.k === "Ref") {
-      if (!all.has(node.n) || seen.has(node.n)) return;
-      seen.add(node.n);
-      return find(all.get(node.n));
-    }
-    if (isComp(node, BAR)) bar ??= node;
-    if (isComp(node, CARD)) cards.push(node);
-    children(node).forEach(find);
-  };
-  const root: ASTNode = { k: "Ref", n: all.has("root") ? "root" : ([...all.keys()][0] ?? "") };
-  find(root);
   const drawn = reads(root);
   const queries = [...drawn.queries].flatMap((name) => {
     const query = call(name);
-    return query && data.tools[query.tool] ? [{ name, ...query }] : [];
+    return query && toolOf(query.tool) ? [{ name, ...query }] : [];
   });
 
   const problems: Problem[] = [];
@@ -249,19 +317,14 @@ export function checkProgram(program: string, data: Dataset = dataset): Problem[
     if (!variable) continue;
 
     // The argument a filter sets is the one it is passed as; unpassed, the one of its name.
-    const feeds = new Set<string>();
-    for (const name of all.keys()) {
-      for (const [argument, value] of call(name)?.args ?? []) {
-        if (value.k === "StateRef" && value.n === variable) feeds.add(argument);
-      }
-    }
+    const feeds = passedAs(variable);
     const named = variable.slice(1);
     if (!feeds.size && Object.values(data.tools).some((tool) => tool.takes.includes(named))) {
       feeds.add(named);
     }
     /** The argument through which this Query can follow the filter, if any. */
     const follows = (query: (typeof queries)[number]) =>
-      data.tools[query.tool]!.takes.find(
+      toolOf(query.tool)!.takes.find(
         (argument) => feeds.has(argument) && !ignores(query, argument),
       );
     // A date or one of the data's filters narrows every card. Any other control in the bar is a

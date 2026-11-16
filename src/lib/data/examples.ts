@@ -13,7 +13,7 @@ $range = "3m"
 $region = ""
 overview = Query("get_sales_overview", {${filterArgs(["region"])}}, {net_sales: 0, orders: 0, aov: 0, previous: {net_sales: null, orders: null, aov: null}})
 overTime = Query("get_sales_trend", {group_by: "category", ${filterArgs(["region"])}}, {periods: [], series: []})
-filters = FilterBar([${dateFilter}, ${dimensionFilter("region")}, CompareToggle("Previous period", true)])
+filters = FilterBar([${dateFilter}, ${dimensionFilter("region")}])
 lead = Section("", [Kpis([Kpi("Net sales", overview.net_sales, "currency-compact", overview.previous.net_sales), Kpi("Orders", overview.orders, "number", overview.previous.orders), Kpi("Average order value", overview.aov, "currency-precise", overview.previous.aov)])])
 trend = Section("Over time", [Row([Card("Net sales by category", [TimeSeries(overTime.periods, @Each(overTime.series, "s", Series(s.name, s.net_sales)), "area", "currency-compact", true)], "full", "USD")])])`;
 

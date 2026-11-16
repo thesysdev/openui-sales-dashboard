@@ -3,18 +3,22 @@
 import { defineToolkit } from "@assistant-ui/react";
 import { z } from "zod";
 import { DashboardCard } from "../components/dashboard";
-import { dashboardBrief, filterChange, readDashboard } from "./brief";
+import { dashboardBrief, filterChange } from "./brief";
+import { readDashboard } from "./check";
 import { chatCases } from "./data/about";
-import { DEFAULT_RANGE, FILTER_NAMES, RANGES, RANGE_VALUES } from "./data/filters";
+import { DEFAULT_RANGE, FILTERS, FILTER_NAMES, RANGES, RANGE_VALUES } from "./data/filters";
 import { baseUrl, dashboards, openui, userId } from "./openui";
 
-// A filter in a dashboard's plan. The names are the data's own (data/filters.ts).
+// A filter in a dashboard's plan. The names and their values are the data's own
+// (data/filters.ts), listed here so the model picks a value that exists.
 const filter = z.object({
   name: z.enum(FILTER_NAMES),
   value: z
     .string()
     .optional()
-    .describe("The value it opens on, when the request narrows to one. Leave out to open on all."),
+    .describe(
+      `The value it opens on, when the request narrows to one: ${FILTER_NAMES.map((name) => `${name} is one of ${FILTERS[name].values.join(", ")}`).join("; ")}. Leave out to open on all, or pass "" to set a filter back to all.`,
+    ),
 });
 
 // The chat model's tools. `execute` runs on this server (the "use generative" compiler keeps it,
@@ -87,7 +91,8 @@ export default defineToolkit({
     execute: async ({ id, prompt, add_filters, remove_filters }, { abortSignal }) => {
       // The dashboard as it is, so the change is written against the filters it has and a new
       // card follows them. The frontend token reads only this visitor's dashboards. When the
-      // program can't be read the change still goes, with the added filters alone written out.
+      // program can't be read, or isn't whole yet, the change still goes, with the added filters
+      // alone written out.
       const now = await openui
         .createFrontendToken({ userId: userId() }, { signal: abortSignal })
         .then(({ token }) =>
@@ -96,9 +101,10 @@ export default defineToolkit({
             signal: abortSignal,
           }),
         )
-        .then((response) => response.json())
-        .then(({ content }: { content?: unknown }) =>
-          typeof content === "string" && content ? readDashboard(content) : undefined,
+        .then((response) => (response.ok ? response.json() : undefined))
+        .then((artifact?: { content?: unknown }) =>
+          // Nothing for a program still being written: it may not have reached its filters.
+          typeof artifact?.content === "string" ? readDashboard(artifact.content) : undefined,
         )
         .catch(() => undefined);
       const filters = filterChange(add_filters, remove_filters, now);

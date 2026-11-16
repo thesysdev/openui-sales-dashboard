@@ -70,9 +70,9 @@ card (the tool's render) ◄─────────── streamed with the 
 1. The chat sends the thread to `/api/chat`. That route streams a reply from OpenUI Gateway with two tools, `create_dashboard` and `edit_dashboard`.
 2. The chat model decides the dashboard's filters from the request before anything is built: the period goes in `range`, and what the request splits by or narrows to goes in `filters`. `create_dashboard` runs on the server, writes that plan out for the builder, and starts generating the dashboard in OpenUI Cloud. It returns as soon as the dashboard has an id.
 3. The tool's card appears in the chat and opens the dashboard in the centre pane. `LiveArtifactRenderer` then streams the dashboard as it's generated.
-4. The dashboard loads its numbers with `Query()` calls. Each one goes to `/api/interpreter`, which runs the matching sales tool in `src/lib/data/sales.ts` against the database. Every tool takes the same arguments for the dashboard's filters (`range`, `region`, `category`, `brand`, `channel`), so each card follows the filter bar.
+4. The dashboard loads its numbers with `Query()` calls. Each one goes to `/api/interpreter`, which runs the matching sales tool in `src/lib/data/sales.ts` against the database. The tools take the dashboard's filters as arguments of the same names (`range`, `region`, `category`, `brand`, `channel`), so a card follows the filter bar wherever its tool has the argument. Targets take `range`, `region` and `category` only.
 5. For a change, the model calls `edit_dashboard` with the dashboard's id, and the notch shows "Updating your dashboard…" until the new version is in. A filter the user wants added or taken away goes in `add_filters` or `remove_filters`.
-6. Each time a version of a dashboard settles, the app checks its filters (`src/lib/check.ts`): every filter in the bar changes every card that can follow it, and no control is left changing nothing. A fresh version that fails is repaired once, with an edit that names exactly what to change. A card that deliberately fixes its own value, and any dashboard opened later, is left as it is.
+6. When a version made while you watch settles, the app checks its filters (`src/lib/check.ts`): every filter in the bar changes every card that can follow it, and no control is left changing nothing. A version that fails is repaired once, with an edit that names exactly what to change. A card that deliberately fixes its own value is left as it is, and a dashboard that is only being opened isn't checked.
 
 OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the browser only through `/api/interpreter`, from your server. Chats are kept in the browser's `localStorage`, with the chat each dashboard was made in, so picking a dashboard in the rail opens its chat.
 
@@ -106,7 +106,7 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 Everything the app says about the data is in `src/lib/data`: the tools dashboards load from, the filters they can be narrowed by (`filters.ts`), a description of the data (`about.ts`) and optional examples (`examples.ts`). The rules for building a dashboard name nothing in that folder. To build dashboards over other data, replace the folder and keep the rest:
 
 - Export `dataTools`, each with a description, its arguments and a sample result.
-- List the filters and date presets in `filters.ts`. A tool follows a filter when it takes an argument of that name; the plan for each dashboard is checked against that.
+- List the filters and date presets in `filters.ts`. A tool follows a filter when it takes an argument of that name; the plan for each dashboard is checked against that. The date filter's argument is always named `range`: a tool that follows the date takes `range`.
 - Describe the data in `about.ts`. `examples.ts` can export an empty list.
 
 The home page's sentence (`src/components/home-sentence.tsx`) and the connected-data popup are specific to the sales data and need their own changes.
@@ -117,4 +117,5 @@ The app binds to loopback. Each browser gets an anonymous visitor id in a cookie
 
 - Add [authentication](https://www.openui.com/docs/gateway/authentication), and use the signed-in user's id in place of the visitor id (`src/lib/visitor.ts`).
 - Add rate limits to the API routes.
+- Keep the record of filter repairs (`src/app/api/check/route.ts`) in a shared store. It is in the server's memory, so across several instances the limit of one repair per version holds only within each.
 - Use a read-only database role for `DATABASE_URL`.
