@@ -812,7 +812,7 @@ const tools = {
   ),
 
   get_targets_vs_actuals: dataTool(
-    "Net sales against the approved monthly sales targets, for the whole business (scope business), each region, or each category. total: target, actual (net sales minus refunds processed), gap (actual minus target), attainment_pct, net_sales (before refunds) and refunds over the whole range, for headline numbers. previous: the same for the months just before (null when they start before the data). totals: the same per scope over the whole range, for a bar or table per region or category. over_time: one row per month (period and the same figures) summed over the scopes, for target against actual over time. rows: one per month and scope, for a month-by-scope grid. over_time and rows reach back at least 6 months, so a short range still shows a trend. Targets are monthly, so the range counts whole months up to the last whole month, and they aren't set per brand or channel. Follows the range filter and the region or category filter: with one set, every scope, business included, gives that region's or category's numbers, so pass it into every call.",
+    "Net sales against the approved monthly sales targets, for the whole business (scope business), each region, or each category. total: target, actual (net sales minus refunds processed), gap (actual minus target), attainment_pct, net_sales (before refunds) and refunds over the whole range, for headline numbers. previous: the same for the months just before (null when they start before the data). totals: the same per scope over the whole range, for a bar or table per region or category. over_time: one row per month (period and the same figures) summed over the scopes, for target against actual over time. rows: one per month and scope, for a month-by-scope grid. periods and series: those months as aligned series, one per scope (its name, and target, actual, gap and attainment_pct per period), for a line per region or category over time. over_time, rows and series reach back at least 6 months, so a short range still shows a trend. Targets are monthly, so the range counts whole months up to the last whole month, and they aren't set per brand or channel. Follows the range filter, and a region or a category filter, never both: scope region and scope business follow region, scope category and scope business follow category, so a dashboard's region or category filter goes into every call that follows it. The other one changes nothing here: targets aren't set for a category within a region, so targets by region can't be narrowed to a category, nor targets by category to a region. No brand or channel filter reaches targets either, so a dashboard with targets on it has at most one filter besides the date: region or category, whichever every targets call on it follows.",
     z.object({
       scope: z.enum(["business", "region", "category"]).default("business"),
       range,
@@ -897,6 +897,23 @@ const tools = {
           attainment_pct: 109.3,
           net_sales: 284_000.2,
           refunds: 21_800.1,
+        },
+      ],
+      periods: ["2026-09", "2026-10"],
+      series: [
+        {
+          name: "West",
+          target: [310_000, 320_000],
+          actual: [298_120.3, 301_410.8],
+          gap: [-11_879.7, -18_589.2],
+          attainment_pct: [96.2, 94.2],
+        },
+        {
+          name: "South",
+          target: [230_000, 240_000],
+          actual: [231_190.1, 262_200.1],
+          gap: [1_190.1, 22_200.1],
+          attainment_pct: [100.5, 109.3],
         },
       ],
     },
@@ -1036,6 +1053,7 @@ const tools = {
         ]);
         // The headline and each scope count the range's own months; the trend may start earlier.
         const inRange = trend.filter((row) => row.month >= rangeStart);
+        const periods = [...new Set(trend.map((row) => row.month))];
         return {
           scope,
           total: figures(add(inRange)),
@@ -1058,6 +1076,19 @@ const tools = {
             ...figures(add(list)),
           })),
           rows: trend,
+          periods,
+          series: groups(trend, (row) => row.scope).map(([name, list]) => {
+            const at = new Map(list.map((row) => [row.month, row]));
+            const each = (key: "target" | "actual" | "gap" | "attainment_pct") =>
+              periods.map((period) => at.get(period)?.[key] ?? null);
+            return {
+              name,
+              target: each("target"),
+              actual: each("actual"),
+              gap: each("gap"),
+              attainment_pct: each("attainment_pct"),
+            };
+          }),
         };
       });
     },

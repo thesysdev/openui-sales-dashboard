@@ -31,7 +31,7 @@ export const filterArgs = (names: readonly FilterName[]) =>
  */
 export function dashboardBrief(start: RangeValue): string {
   return [
-    `Filters. Choose them for what this dashboard shows. The date filter starts at $range = ${JSON.stringify(start)}. Add the others a reader of these cards would reach for, out of the arguments the tools take: a region, category, brand or channel to narrow by, or a choice such as what to rank by. One that changes the whole dashboard goes in the FilterBar, one that changes a single card in that Card's controls. Options are the values the tool lists.`,
-    "Every Query passes range: $range and each other filter's variable its tool takes. Leave out a filter or a card's switch that no Query or chart would read. No Query sets its own period, and no title, subtitle or hint names one: the date filter does.",
+    `Filters. The date filter starts at $range = ${JSON.stringify(start)}. The others are your choice for what this dashboard shows: the few its reader would narrow it by, not every one the tools take. A filter with no data behind it makes no sense: one goes in the FilterBar only if every Query on the dashboard can pass it, so every card changes with it. One that changes a single card goes in that Card's controls. Options are the values the tool lists.`,
+    "Every Query passes range: $range and the variable of each filter in the FilterBar. No Query sets its own period, and no title, subtitle or hint names one: the date filter does.",
   ].join("\n");
 }

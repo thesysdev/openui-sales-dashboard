@@ -1,7 +1,8 @@
-// What a dashboard can filter by: the four dimensions every data tool narrows to, with the values
-// in the data, and the date presets. One list, read by the data tools (their argument schemas)
-// and by create_dashboard (the filter bar it asks for), so a filter never offers a value the
-// tools don't know.
+// What a dashboard can filter by: the four dimensions every data tool narrows to, and the date
+// presets. One list, read by the data tools (their argument schemas) and by the examples the
+// builder learns from, so a filter never offers a value the tools don't know. The values are
+// spelled as the tools' rows show them ("Apparel", "Paid search"), so a dashboard can match a
+// filter's value against a row's name; the tools read them in any case.
 
 export const FILTERS = {
   region: {
@@ -12,7 +13,7 @@ export const FILTERS = {
   category: {
     label: "Category",
     all: "All categories",
-    values: ["apparel", "footwear", "accessories"],
+    values: ["Apparel", "Footwear", "Accessories"],
   },
   brand: {
     label: "Brand",
@@ -30,13 +31,13 @@ export const FILTERS = {
     label: "Channel",
     all: "All channels",
     values: [
-      "direct",
-      "email",
-      "organic_search",
-      "paid_search",
-      "paid_social",
-      "referral",
-      "affiliate",
+      "Direct",
+      "Email",
+      "Organic search",
+      "Paid search",
+      "Paid social",
+      "Referral",
+      "Affiliate",
     ],
   },
 } as const;
