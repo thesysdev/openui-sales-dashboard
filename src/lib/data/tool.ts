@@ -1,13 +1,13 @@
 import type { DataTool } from "@openuidev/server";
 import { z } from "zod";
-import type { Ignores } from "../check";
+import type { Ignores } from "../program";
 
 /**
  * A data tool. `parameters` describes the arguments for generation; `output` is an example
  * result, so generated dashboards know the shape of the data (static, so defining the tools
  * never calls the network); `run` reads its arguments leniently (see fetch.ts). `ignores` names
- * the arguments some of its calls don't follow, for the dashboard check (../check.ts);
- * generation doesn't see it.
+ * the arguments some of its calls don't follow, for the filter plan (../brief.ts); generation
+ * doesn't see it.
  */
 export function dataTool(
   description: string,

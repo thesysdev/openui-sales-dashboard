@@ -1,4 +1,4 @@
-import { dataset, type Current } from "./check";
+import { dataset, type Current } from "./program";
 import { dataTools } from "./data";
 import { FILTERS, type FilterName, type RangeValue } from "./data/filters";
 import { dateFilter, dimensionFilter } from "./filter-bar";
@@ -54,7 +54,7 @@ const written = ({ name, value }: Pick<Planned, "name" | "value">) => [
 
 /**
  * What a card or a Kpi says when it can't follow a filter: the filter's label for all, in the
- * card's subtitle or the Kpi's hint. The check (check.ts) looks for it in both.
+ * card's subtitle or the Kpi's hint.
  */
 const saysAll = (argument: string) =>
   Object.hasOwn(FILTERS, argument)
@@ -135,7 +135,7 @@ const list = (items: readonly string[]) =>
 /**
  * What edit_dashboard adds to its prompt: the filters to add or take away, then the filters the
  * dashboard has after the change and which Queries pass them, so a card the change adds follows
- * them too. `now` is the dashboard as it is (readDashboard in check.ts), when its program could
+ * them too. `now` is the dashboard as it is (readDashboard in program.ts), when its program could
  * be read: its filters go by the variables it gave them, whatever those are named. Without it
  * only the filters being added are written out.
  */

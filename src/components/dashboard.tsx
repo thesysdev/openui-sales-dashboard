@@ -27,10 +27,8 @@ export type DashboardSource = { response: string } | { id: string };
 
 /** The dashboard in the side panel: the card or list row that opened it, and what to render.
  * `edit` marks an edit_dashboard result, so the panel says it is updating, not building.
- * `made` marks a version made while you watch (a tool result that just arrived): its filters
- * are checked once. A dashboard opened from the list, from history or by a repair is not.
  * `rev` counts refreshes: bumping it remounts the panel, which runs its queries again. */
-type Open = DashboardSource & { key: string; edit?: boolean; made?: boolean; rev?: number };
+type Open = DashboardSource & { key: string; edit?: boolean; rev?: number };
 
 const OpenDashboard = createContext<{
   open: Open | null;
@@ -51,8 +49,6 @@ const OpenDashboard = createContext<{
 });
 
 let openNow: string | null = null;
-/** What the panel shows now, for work that finishes after the panel may have changed. */
-let shown: Open | null = null;
 
 /** The open dashboard's artifact id, for the chat's requests: "it" in a message means this one. */
 export const openDashboardId = () => openNow;
@@ -65,9 +61,6 @@ export function OpenDashboardProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     openNow = openId;
   }, [openId]);
-  useEffect(() => {
-    shown = open;
-  }, [open]);
 
   // A chat that starts while a dashboard picked from the list is open becomes that dashboard's
   // chat, so picking the dashboard again opens it. A chat gets its id when it sends its first message.
@@ -125,7 +118,7 @@ export function DashboardCard({
   useEffect(() => {
     if (!response || opened.current || !live.current) return;
     opened.current = true;
-    setOpen({ key: toolCallId, response, edit, made: true });
+    setOpen({ key: toolCallId, response, edit });
   }, [response, toolCallId, edit, setOpen]);
 
   const title =
@@ -212,7 +205,6 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
         <LiveArtifactRenderer.Chrome>
           <div ref={frame} className="relative h-full w-full bg-background">
             <PanelReport />
-            <FilterCheck />
             <DashboardNotch frame={frame} edit={edit} />
             {/* No top padding: the filter bar sticks to this scroller's content edge, so padding
                 above it would leave a strip where scrolled cards show over the bar. The
@@ -245,47 +237,6 @@ function PanelReport() {
     if (wasStreaming.current && !isStreaming) onSaved();
     wasStreaming.current = isStreaming;
   }, [isStreaming, onSaved]);
-  return null;
-}
-
-// The versions whose filters this page has checked, by the key of the panel that showed them, so
-// refreshing or reopening one doesn't check it again.
-const checked = new Set<string>();
-
-/**
- * Checks the filters of a version made while you watch, once it settles: /api/check reads its
- * program and, when a filter or a switch changes nothing, starts one repair. The repair opens as
- * an edit_dashboard result does, so the notch says the dashboard is updating. A dashboard that is
- * only being opened, and the version a repair makes, are not checked.
- */
-function FilterCheck() {
-  const { id, isStreaming, isLoading } = useArtifactRenderer();
-  const { open, setOpen } = useOpenDashboard();
-  const key = open?.made ? open.key : null;
-  const streamed = useRef(false);
-  useEffect(() => {
-    if (isStreaming) streamed.current = true;
-    if (isLoading || !streamed.current || !id || !key || checked.has(key)) return;
-    checked.add(key);
-    fetch(withBase("/api/check"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id }),
-    })
-      .then((response) => response.json())
-      .then(({ repair }: { repair?: string }) => {
-        // Only while the version that was checked is still the one open: a newer one, such as
-        // the user's own edit, is not replaced. The repair keeps the card's key, so the card
-        // that made the dashboard still reads as open, and isn't marked made, so it isn't
-        // checked in turn.
-        if (repair && shown?.key === key) {
-          setOpen({ key, response: repair, edit: true, rev: (shown.rev ?? 0) + 1 });
-        }
-      })
-      .catch(() => {
-        // The check is a safeguard; when it fails the dashboard stays as it is.
-      });
-  }, [id, isStreaming, isLoading, key, setOpen]);
   return null;
 }
 

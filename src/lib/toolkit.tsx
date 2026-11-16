@@ -4,7 +4,7 @@ import { defineToolkit } from "@assistant-ui/react";
 import { z } from "zod";
 import { DashboardCard } from "../components/dashboard";
 import { dashboardBrief, filterChange } from "./brief";
-import { readDashboard } from "./check";
+import { readDashboard } from "./program";
 import { chatCases } from "./data/about";
 import { DEFAULT_RANGE, FILTERS, FILTER_NAMES, RANGES, RANGE_VALUES } from "./data/filters";
 import { baseUrl, dashboards, openui, userId } from "./openui";
