@@ -27,8 +27,9 @@ export type DashboardSource = { response: string } | { id: string };
 
 /** The dashboard in the side panel: the card or list row that opened it, and what to render.
  * `edit` marks an edit_dashboard result, so the panel says it is updating, not building.
+ * `repaired` marks the filter check's own repair, which is checked but not repaired again.
  * `rev` counts refreshes: bumping it remounts the panel, which runs its queries again. */
-type Open = DashboardSource & { key: string; edit?: boolean; rev?: number };
+type Open = DashboardSource & { key: string; edit?: boolean; repaired?: boolean; rev?: number };
 
 const OpenDashboard = createContext<{
   open: Open | null;
@@ -205,6 +206,7 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
         <LiveArtifactRenderer.Chrome>
           <div ref={frame} className="relative h-full w-full bg-background">
             <PanelReport />
+            <FilterCheck />
             <DashboardNotch frame={frame} edit={edit} />
             {/* No top padding: the filter bar sticks to this scroller's content edge, so padding
                 above it would leave a strip where scrolled cards show over the bar. The
@@ -237,6 +239,39 @@ function PanelReport() {
     if (wasStreaming.current && !isStreaming) onSaved();
     wasStreaming.current = isStreaming;
   }, [isStreaming, onSaved]);
+  return null;
+}
+
+/**
+ * Checks the dashboard's filters each time a version of it settles: /api/check reads its program
+ * and, when a filter or a switch changes nothing, starts one repair. The repair opens as an
+ * edit_dashboard result does, so the notch says the dashboard is updating.
+ */
+function FilterCheck() {
+  const { id, isStreaming, isLoading } = useArtifactRenderer();
+  const { open, setOpen } = useOpenDashboard();
+  const repaired = open?.repaired ?? false;
+  const streamed = useRef(false);
+  useEffect(() => {
+    if (isStreaming) streamed.current = true;
+    if (isLoading || !streamed.current || !id) return;
+    streamed.current = false;
+    fetch(withBase("/api/check"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, repaired }),
+    })
+      .then((response) => response.json())
+      .then(({ repair }: { repair?: string }) => {
+        // Only while this dashboard is still the open one.
+        if (repair && openNow === id) {
+          setOpen({ key: `repair:${id}`, response: repair, edit: true, repaired: true });
+        }
+      })
+      .catch(() => {
+        // The check is a safeguard; when it fails the dashboard stays as it is.
+      });
+  }, [id, isStreaming, isLoading, repaired, setOpen]);
   return null;
 }
 

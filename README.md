@@ -68,10 +68,11 @@ card (the tool's render) ◄─────────── streamed with the 
 ```
 
 1. The chat sends the thread to `/api/chat`. That route streams a reply from OpenUI Gateway with two tools, `create_dashboard` and `edit_dashboard`.
-2. `create_dashboard` runs on the server and starts generating the dashboard in OpenUI Cloud. It returns as soon as the dashboard has an id.
+2. The chat model decides the dashboard's filters from the request before anything is built: the period goes in `range`, and what the request splits by or narrows to goes in `filters`. `create_dashboard` runs on the server, writes that plan out for the builder, and starts generating the dashboard in OpenUI Cloud. It returns as soon as the dashboard has an id.
 3. The tool's card appears in the chat and opens the dashboard in the centre pane. `LiveArtifactRenderer` then streams the dashboard as it's generated.
 4. The dashboard loads its numbers with `Query()` calls. Each one goes to `/api/interpreter`, which runs the matching sales tool in `src/lib/data/sales.ts` against the database. Every tool takes the same arguments for the dashboard's filters (`range`, `region`, `category`, `brand`, `channel`), so each card follows the filter bar.
-5. For a change, the model calls `edit_dashboard` with the dashboard's id, and the notch shows "Updating your dashboard…" until the new version is in.
+5. For a change, the model calls `edit_dashboard` with the dashboard's id, and the notch shows "Updating your dashboard…" until the new version is in. A filter the user wants added or taken away goes in `add_filters` or `remove_filters`.
+6. Each time a version of a dashboard settles, the app checks its filters (`src/lib/check.ts`): every filter in the bar changes every card that can follow it, and no control is left changing nothing. A fresh version that fails is repaired once, with an edit that names exactly what to change. A card that deliberately fixes its own value, and any dashboard opened later, is left as it is.
 
 OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the browser only through `/api/interpreter`, from your server. Chats are kept in the browser's `localStorage`, with the chat each dashboard was made in, so picking a dashboard in the rail opens its chat.
 
@@ -85,8 +86,10 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 | `src/lib/visitor.ts`, `src/proxy.ts` | Each browser's anonymous visitor id, which owns its dashboards |
 | `src/lib/base-path.ts` | The base path, for hand-written URLs |
 | `src/lib/toolkit.tsx` | `create_dashboard` and `edit_dashboard`: schema, `execute`, `render` |
-| `src/lib/filter-bar.ts`, `examples.ts` | What `create_dashboard` asks of every dashboard (filters that every query follows; the builder picks which, and the charts and layout), and short examples of how the data is wired |
-| `src/lib/prompt.ts` | Chat instructions and the data dashboards can show |
+| `src/lib/data/about.ts`, `examples.ts` | The dataset in words, and short examples of how its data is wired |
+| `src/lib/brief.ts`, `filter-bar.ts` | The filter plan `create_dashboard` hands the builder: each planned filter written out, and which queries pass it, worked out from the data tools' arguments |
+| `src/lib/check.ts`, `src/app/api/check/route.ts` | The filter check run on each settled version: every filter changes every card that can follow it, and a dashboard that fails is repaired once with an exact edit |
+| `src/lib/prompt.ts` | Chat instructions: rules that hold for any dataset, around the dataset's own description |
 | `src/app/page.tsx`, `src/components/home-sentence.tsx` | Home page and the sentence builder |
 | `src/components/app.tsx` | Runtime, providers, and the three-pane layout |
 | `src/components/dashboard.tsx` | Chat card, dashboard panel and status notch |
@@ -97,6 +100,16 @@ OpenUI Cloud stores each dashboard's definition, not its data. Numbers reach the
 | `src/app/api/followups/route.ts` | Follow-up suggestions |
 
 `npm run generate` builds the component spec in `src/generated/` (ignored) before `dev` and `build`.
+
+## Use another dataset
+
+Everything the app says about the data is in `src/lib/data`: the tools dashboards load from, the filters they can be narrowed by (`filters.ts`), a description of the data (`about.ts`) and optional examples (`examples.ts`). The rules for building a dashboard name nothing in that folder. To build dashboards over other data, replace the folder and keep the rest:
+
+- Export `dataTools`, each with a description, its arguments and a sample result.
+- List the filters and date presets in `filters.ts`. A tool follows a filter when it takes an argument of that name; the plan for each dashboard is checked against that.
+- Describe the data in `about.ts`. `examples.ts` can export an empty list.
+
+The home page's sentence (`src/components/home-sentence.tsx`) and the connected-data popup are specific to the sales data and need their own changes.
 
 ## Before deploying
 
