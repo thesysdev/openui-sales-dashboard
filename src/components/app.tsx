@@ -142,7 +142,7 @@ function Shell() {
   }, [dbOpen]);
 
   return (
-    <div className="flex h-dvh flex-col overflow-hidden border-t border-foreground/[0.06] bg-background">
+    <div className="flex h-full flex-col overflow-hidden border-t border-foreground/[0.06] bg-background">
       <AgentView
         hidden={false}
         onShowData={() => {
