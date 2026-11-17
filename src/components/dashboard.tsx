@@ -22,8 +22,9 @@ import { Notch } from "./notch";
 import { withBase } from "../lib/base-path";
 import { rememberChat, rememberChatOf } from "./threads";
 
-/** What the renderer streams: a tool call's result, as is, or for a dashboard from the list, its id. */
-export type DashboardSource = { response: string } | { id: string };
+/** What the renderer streams: a tool call's result, as is, or for a dashboard from the list, its id.
+ * `pending` is a create_dashboard call that hasn't returned yet: nothing to stream so far. */
+export type DashboardSource = { response: string } | { id: string } | { pending: true };
 
 /** The dashboard in the side panel: the card or list row that opened it, and what to render.
  * `edit` marks an edit_dashboard result, so the panel says it is updating, not building.
@@ -110,16 +111,26 @@ export function DashboardCard({
     if (!edit && response && chatId) rememberChat(response, chatId);
   }, [edit, response, chatId]);
 
-  // Opens once, when the result arrives while you watch, so opening another dashboard afterwards
-  // sticks. A card that loads with its result, from a chat's history, doesn't open: the panel
-  // keeps the dashboard that was picked.
+  // Opens once, while you watch: a new dashboard as soon as the call starts, an edit when its
+  // result arrives (until then the dashboard on screen says it's updating). Opening another
+  // dashboard afterwards sticks. A card that loads with its result, from a chat's history,
+  // doesn't open: the panel keeps the dashboard that was picked.
+  const running = status?.type === "running";
   const live = useRef(!response);
   const opened = useRef(false);
+  const waitingHere = open?.key === toolCallId && "pending" in open;
   useEffect(() => {
-    if (!response || opened.current || !live.current) return;
-    opened.current = true;
-    setOpen({ key: toolCallId, response, edit });
-  }, [response, toolCallId, edit, setOpen]);
+    if (!live.current) return;
+    if (!opened.current) {
+      if (!response && (edit || !running)) return;
+      opened.current = true;
+      setOpen(response ? { key: toolCallId, response, edit } : { key: toolCallId, pending: true });
+    } else if (waitingHere && (response || !running)) {
+      // The call the panel waits on ended. Its result fills the same panel (same key, so no
+      // remount); stopped or failed, the panel closes.
+      setOpen(response ? { key: toolCallId, response } : null);
+    }
+  }, [response, running, edit, waitingHere, toolCallId, setOpen]);
 
   const title =
     args?.title ?? (toolName === "edit_dashboard" ? "Dashboard change" : "New dashboard");
@@ -188,6 +199,9 @@ export function DashboardCard({
 export function DashboardPanel({ edit = false, ...source }: DashboardSource & { edit?: boolean }) {
   const mode = useColorScheme();
   const frame = useRef<HTMLDivElement>(null);
+  // Pending passes neither `response` nor `id`: the renderer shows its Pending slot until the
+  // card hands over the call's result.
+  const stream = "pending" in source ? {} : source;
 
   // LiveArtifactRenderer streams the dashboard from OpenUI Cloud and runs its Query() calls
   // through /api/interpreter. `preview={false}` renders it in place, framed by our Chrome. Every
@@ -196,7 +210,7 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
   return (
     <ThemeProvider mode={mode}>
       <LiveArtifactRenderer
-        {...source}
+        {...stream}
         library={library}
         interpreter={{ url: withBase("/api/interpreter") }}
         preview={false}
@@ -207,6 +221,7 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
             <PanelReport />
             <DashboardNotch frame={frame} edit={edit} />
             <LiveArtifactRenderer.Content className="relative h-full overflow-y-auto p-4 sm:p-6">
+              <LiveArtifactRenderer.Pending />
               <LiveArtifactRenderer.Error>
                 <DashboardError />
               </LiveArtifactRenderer.Error>
@@ -270,8 +285,9 @@ function DashboardNotch({
   frame: RefObject<HTMLDivElement | null>;
   edit: boolean;
 }) {
-  const { id, isStreaming, isFetching, isLoading } = useArtifactRenderer();
-  const busy = isStreaming || isFetching || isLoading;
+  const { id, isPending, isStreaming, isLoading } = useArtifactRenderer();
+  // While the call that makes the dashboard runs, the Pending loader shows the status.
+  const busy = isLoading && !isPending;
   // The agent is calling edit_dashboard right now: the change hasn't come back yet, so the
   // dashboard on screen is the one being updated.
   const editing = useAuiState(
@@ -340,7 +356,7 @@ function DashboardNotch({
 
   const working = editing || busy || measuring;
   const label =
-    editing || (edit && (isStreaming || isLoading))
+    editing || (edit && busy)
       ? "Updating your dashboard…"
       : working
         ? isStreaming
