@@ -5,7 +5,7 @@ import { withBase } from "../lib/base-path";
 
 export default function Home() {
   return (
-    <div className="flex min-h-dvh flex-col bg-background">
+    <div className="flex min-h-full flex-col bg-background">
       <main className="mx-auto flex w-full flex-1 flex-col px-6">
         <HomeSentence />
       </main>
