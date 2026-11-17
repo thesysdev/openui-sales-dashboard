@@ -17,52 +17,217 @@ import {
 } from "./db";
 import { record, toolContext } from "./activity";
 import { cacheHas, cached, int, oneOf, text } from "./fetch";
+import { OPTIONS_TOOL, optionLabel } from "./filters";
 import { dataTool } from "./tool";
+import { filterOptions, found, foundFilters, type Filter } from "./values";
 
 // Data tools over the Neon sales database (schema `retail`): 100k orders from Nov 2024 to
 // its latest order, in USD. "Net sales" is revenue after discounts (before refunds): completed, captured
 // orders only, with test orders and internal customers excluded. Refunds come from returns,
 // by the date they were processed. Results are cached for 3 minutes.
+//
+// Every tool takes `range`, a dashboard's date filter value as is, and any filter the data has
+// (values.ts finds them in the database) as an argument of the filter's name. A dashboard passes
+// its filters into each Query unchanged, so every card follows them, and never has to work a
+// date out itself.
 
 const TTL = 3 * 60_000;
 const run = <T>(name: string, args: Record<string, unknown>, load: () => Promise<T>) => {
   const key = `sales:${name}:${JSON.stringify(args)}`;
   // One activity event per tool call; a cache hit runs no SQL, and the panel says so.
-  record({ kind: "tool", tool: name, args, cache: cacheHas(key) ? "hit" : "miss" });
+  record({
+    kind: "tool",
+    tool: name,
+    args,
+    cache: cacheHas(key) ? "hit" : "miss",
+  });
   return toolContext.run(name, () => cached(key, TTL, load));
 };
 
 const INTERVALS = ["day", "week", "month"] as const;
-const TREND_DIMS = ["none", "region", "category", "brand", "channel", "device"] as const;
-const BREAKDOWN_DIMS = Object.keys(DIMENSIONS) as Dimension[];
+type Interval = (typeof INTERVALS)[number];
 
-const rangeParams = {
-  months: z
-    .number()
-    .int()
-    .min(1)
-    .max(24)
-    .default(6)
-    .describe(
-      "How many months back from the last day of data, 1 to 24; monthly series count whole months up to the last whole month. Ignored when from/to are set.",
-    ),
-  from: z.string().optional().describe("Start date YYYY-MM-DD (data starts 2024-11-01)"),
-  to: z
-    .string()
-    .optional()
-    .describe("End date YYYY-MM-DD, default the last day of data (the last whole month's end for monthly series)"),
-};
+// What a tool splits by is found in the data too: any filter it has (values.ts), by the filter's
+// name. The columns the tools already read (DIMENSIONS) stay available when one of them isn't a
+// filter there, as a column with too many values to pick from.
+
+/** A series per value stays readable up to this many; a split with more is a table or a bar. */
+const MOST_SERIES = 8;
+/** The names the data can be split by; with `most`, only those with that many values or fewer. */
+const splitNames = (most?: number): string[] => [
+  ...new Set([
+    ...foundFilters()
+      .filter(({ values }) => !most || values.length <= most)
+      .map(({ name }) => name),
+    // Before the data has been looked at, the columns the tools read are all there is to offer.
+    ...(most && foundFilters().length ? [] : Object.keys(DIMENSIONS)),
+  ]),
+];
+/** The column a split reads, and whether reading it needs the products join. */
+const splitColumn = (name: string): { sql: string; products: boolean } =>
+  foundFilters().find((filter) => filter.name === name) ?? DIMENSIONS[name as Dimension];
+/**
+ * A split argument: the tool's own choices, then every name the data can be split by. Read each
+ * time a dashboard is generated (tool.ts), so the names are the ones the data has then.
+ */
+const splitParam = (own: readonly string[], fallback: string, most?: number) =>
+  z
+    .enum([...new Set([...own, fallback, ...splitNames(most)])] as [string, ...string[]])
+    .default(fallback);
+/** The split a call asks for: one of the tool's own choices or of the data's; otherwise `fallback`. */
+const splitOf = (value: unknown, own: readonly string[], fallback: string, most?: number) =>
+  oneOf(value, [...own, ...splitNames(most)], fallback);
+
+const range = z
+  .string()
+  .optional()
+  .describe(
+    'The dashboard\'s date filter value, as is: "1m", "3m", "6m" or "12m" (months back from the last day of data), "30d", "ytd", "lifetime", or a custom "YYYY-MM-DD..YYYY-MM-DD". Default "6m".',
+  );
+
+/** A filter's argument: one of the values the options tool lists for it, or "" for all. */
+const filterParam = (label: string) =>
+  z.string().optional().describe(`${label} filter: a value ${OPTIONS_TOOL} lists. "" for all.`);
+
+/** What every tool takes besides its own arguments: the date range. */
+const frame = { range };
+
+/** A tool's arguments when it follows the filters: its own, and any filter by its name. */
+const following = <Shape extends z.ZodRawShape>(shape: Shape) =>
+  z
+    .object(shape)
+    .catchall(
+      z
+        .string()
+        .describe(
+          `Any filter ${OPTIONS_TOOL} lists, as an argument of the filter's name: one of that filter's values, or "" for all.`,
+        ),
+    );
+
+/**
+ * The arguments with `range` read into months or from/to: "3m" is 3 months back, "30d" 30 days,
+ * "ytd" this year, "lifetime" all the data, and "2026-09-08..2026-10-15" those dates. Dashboards
+ * made before `range` pass months or from/to themselves, which read as before.
+ */
+async function withRange(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const value = text(args.range).toLowerCase().replace(/\s+/g, "");
+  if (!value) return args;
+  const custom = value.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
+  if (custom) return { ...args, from: custom[1], to: custom[2] };
+  const { first, last } = await dataDays();
+  // No `to`: the last day of data, or for monthly series the last whole month.
+  if (/^(lifetime|all|alltime|max)$/.test(value)) return { ...args, from: first, to: undefined };
+  if (value === "ytd") return { ...args, from: `${last.slice(0, 4)}-01-01`, to: undefined };
+  // "3m", "30d", "1y", "last_quarter", "last-month", "6months"…
+  const preset = value.match(
+    /^(?:last[_-]?)?(\d+)?[_-]?(days?|weeks?|months?|quarters?|years?|d|w|m|q|y)$/,
+  );
+  if (!preset) return args;
+  const count = Number(preset[1] ?? 1);
+  const unit = preset[2]![0];
+  if (unit === "d" || unit === "w") {
+    const start = new Date(`${last}T00:00:00Z`);
+    start.setUTCDate(start.getUTCDate() - (unit === "d" ? count : count * 7) + 1);
+    return { ...args, from: start.toISOString().slice(0, 10), to: last };
+  }
+  const months = unit === "m" ? count : unit === "q" ? count * 3 : count * 12;
+  return {
+    ...args,
+    months: Math.min(24, Math.max(1, months)),
+    from: undefined,
+    to: undefined,
+  };
+}
+
+/** The filters a call sets, by name, each as its column holds the value. */
+type Slice = Record<string, string>;
+
+/** One filter value, lower-cased; "", "all", "All regions" and the like mean no filter. */
+function sliceValue(value: unknown): string {
+  const picked = text(value).toLowerCase().slice(0, 60);
+  return /^(all|any)\b/.test(picked) ? "" : picked;
+}
+
+/** The data's filters as of the last call, for the SQL that narrows by them. */
+let filters: Filter[] = [];
+
+/**
+ * Reads a call's filters: any argument named after a filter the data has. A value may arrive as
+ * a reader sees it ("Paid search") or as the column has it ("paid_search").
+ */
+async function readSlice(args: Record<string, unknown>): Promise<Slice> {
+  ({ filters } = await found());
+  const slice: Slice = {};
+  for (const { name, values, raw } of filters) {
+    const picked = sliceValue(args[name]);
+    if (!picked) continue;
+    const same = (value: string) => value.toLowerCase() === picked;
+    const at = values.findIndex(same);
+    slice[name] = (raw[at < 0 ? raw.findIndex(same) : at] ?? picked).toLowerCase();
+  }
+  return slice;
+}
+
+/**
+ * SQL for a slice, numbering its parameters from `first`: ` AND lower(o.shipping_region) = $3…`,
+ * and whether it needs the products join (some filters are columns of the products tables).
+ */
+function sliceWhere(
+  slice: Slice,
+  first: number,
+): { sql: string; params: string[]; products: boolean } {
+  const params: string[] = [];
+  let sql = "";
+  let products = false;
+  for (const filter of filters) {
+    const value = slice[filter.name];
+    if (!value) continue;
+    params.push(value);
+    sql += ` AND lower(${filter.sql}) = $${first + params.length - 1}`;
+    products ||= filter.products;
+  }
+  return { sql, params, products };
+}
 
 /** Period expression and label format for a trend interval. */
-const periodExpr = (interval: (typeof INTERVALS)[number], column: string) =>
+const periodExpr = (interval: Interval, column: string) =>
   interval === "month"
     ? `to_char(date_trunc('month', ${column}), 'YYYY-MM')`
     : `to_char(date_trunc('${interval}', ${column}), 'YYYY-MM-DD')`;
 
-export const salesTools = {
+const days = (from: string, to: string) =>
+  Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000) + 1;
+
+/** Whether a call passes `range`. Dashboards made before it get the results they were written for. */
+const modern = (args: Record<string, unknown>) => Boolean(text(args.range));
+
+/**
+ * How a range reads over time: per day up to 2 months, per week up to 6, per month beyond, and
+ * the dates its periods cover. Months are whole ones, up to the last whole month, so a series
+ * never starts or ends on part of a month.
+ */
+async function overTime(ranged: Record<string, unknown>, from: string, to: string) {
+  const span = days(from, to);
+  const interval: Interval = span <= 62 ? "day" : span <= 200 ? "week" : "month";
+  if (interval !== "month") return { interval, from, to };
+  return { interval, ...(await dateRange(ranged, 6, { wholeMonths: true })) };
+}
+
+const tools = {
+  [OPTIONS_TOOL]: dataTool(
+    "The options of a dashboard's filters, read from the data: for each filter the data has, under the filter's name, a list of {value, label} that starts with the all option. A filter's options are this list as is, never written in. Takes no arguments.",
+    z.object({}),
+    {
+      filter_name: [
+        { value: "", label: "All" },
+        { value: "A value", label: "A value" },
+      ],
+    },
+    () => run("filter_options", {}, filterOptions),
+  ),
   get_sales_overview: dataTool(
-    "Headline KPIs for a date range, with the previous range of the same length for comparison: net_sales (USD, after discounts, before refunds), orders, units, aov (average order value), discount_amount and discount_rate_pct, gross_margin_pct, refund_amount, returned_units and refund_rate_pct (refunds processed in the range as a share of net sales), plus previous {net_sales, orders, aov} and change {net_sales_pct, orders_pct, aov_pct}.",
-    z.object({ ...rangeParams }),
+    "Headline KPIs for the range: net_sales (USD, after discounts, before refunds), orders, units, aov (average order value), discount_amount and discount_rate_pct, gross_margin_pct, refund_amount, returned_units and refund_rate_pct (refunds processed in the range as a share of net sales). previous {net_sales, orders, units, aov, gross_margin_pct, refund_rate_pct} is the same for the range of the same length just before, and change {net_sales_pct, orders_pct, aov_pct} the move from it; both are null when that earlier range starts before the data does (a long range, or lifetime). Follows the range filter and every filter get_filter_options lists.",
+    following(frame),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -76,13 +241,26 @@ export const salesTools = {
       refund_amount: 948_112.4,
       returned_units: 10_980,
       refund_rate_pct: 18.2,
-      previous: { net_sales: 4_890_200.1, orders: 25_100, aov: 194.83 },
+      previous: {
+        net_sales: 4_890_200.1,
+        orders: 25_100,
+        units: 51_300,
+        aov: 194.83,
+        gross_margin_pct: 57.6,
+        refund_rate_pct: 17.4,
+      },
       change: { net_sales_pct: 6.4, orders_pct: 5.2, aov_pct: 1.1 },
     },
     async (args, signal) => {
-      const { from, to } = await dateRange(args);
+      const { from, to } = await dateRange(await withRange(args));
       const prev = previousRange(from, to);
-      return run("overview", { from, to }, async () => {
+      // A previous range reaching before the data would compare with a few weeks of orders.
+      const comparable = prev.from >= (await dataDays()).first;
+      const slice = await readSlice(args);
+      return run("overview", { from, to, ...slice }, async () => {
+        const filter = sliceWhere(slice, 4);
+        const joins = filter.products ? PRODUCTS_JOIN : "";
+        const params = [prev.from, from, to, ...filter.params];
         const [sales, refunds] = await Promise.all([
           query(
             `SELECT (o.placed_at >= $2::date) AS current,
@@ -92,20 +270,20 @@ export const salesTools = {
                     ${money("oi.line_discount_amount")} AS discount_amount,
                     ${money("oi.line_list_amount")} AS list_amount,
                     ${money("oi.unit_cogs_at_sale * oi.ordered_qty")} AS cogs
-             FROM ${ORDERS_JOIN}
-             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $3::date + 1
+             FROM ${ORDERS_JOIN}${joins}
+             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $3::date + 1${filter.sql}
              GROUP BY 1`,
-            [prev.from, from, to],
+            params,
             signal,
           ),
           query(
             `SELECT (r.processed_at >= $2::date) AS current,
                     ${money("r.product_refund_amount")} AS refund_amount,
                     coalesce(sum(r.returned_qty), 0)::int AS returned_units
-             FROM ${RETURNS_JOIN}
-             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $3::date + 1
+             FROM ${RETURNS_JOIN}${joins}
+             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $3::date + 1${filter.sql}
              GROUP BY 1`,
-            [prev.from, from, to],
+            params,
             signal,
           ),
         ]);
@@ -120,10 +298,12 @@ export const salesTools = {
           }) as Record<string, number>;
         const cur = bucket(true);
         const was = bucket(false);
-        const ref = (refunds.find((row) => row.current === true) ?? {
-          refund_amount: 0,
-          returned_units: 0,
-        }) as Record<string, number>;
+        const refund = (current: boolean) =>
+          (refunds.find((row) => row.current === current) ?? {
+            refund_amount: 0,
+            returned_units: 0,
+          }) as Record<string, number>;
+        const ref = refund(true);
         const aov = cur.orders ? round2(cur.net_sales / cur.orders) : 0;
         const prevAov = was.orders ? round2(was.net_sales / was.orders) : 0;
         return {
@@ -139,24 +319,43 @@ export const salesTools = {
           refund_amount: ref.refund_amount,
           returned_units: ref.returned_units,
           refund_rate_pct: pct(ref.refund_amount, cur.net_sales),
-          previous: { net_sales: was.net_sales, orders: was.orders, aov: prevAov },
-          change: {
-            net_sales_pct: changePct(cur.net_sales, was.net_sales),
-            orders_pct: changePct(cur.orders, was.orders),
-            aov_pct: changePct(aov, prevAov),
-          },
+          previous: comparable
+            ? {
+                net_sales: was.net_sales,
+                orders: was.orders,
+                units: was.units,
+                aov: prevAov,
+                gross_margin_pct: pct(was.net_sales - was.cogs, was.net_sales),
+                refund_rate_pct: pct(refund(false).refund_amount, was.net_sales),
+              }
+            : {
+                net_sales: null,
+                orders: null,
+                units: null,
+                aov: null,
+                gross_margin_pct: null,
+                refund_rate_pct: null,
+              },
+          change: comparable
+            ? {
+                net_sales_pct: changePct(cur.net_sales, was.net_sales),
+                orders_pct: changePct(cur.orders, was.orders),
+                aov_pct: changePct(aov, prevAov),
+              }
+            : { net_sales_pct: null, orders_pct: null, aov_pct: null },
         };
       });
     },
   ),
 
   get_sales_trend: dataTool(
-    "Net sales (USD) and orders over time, per day, week, or month, as aligned series: the period labels (weeks are labelled by their Monday), and one series per group with net_sales and orders per period, total, and change_pct (last period vs the one before). group_by none gives a single 'All' series; region, category, brand, channel, or device gives one series each. Monthly series end at the last whole month; day and week series run to the last day of data, so their first and last periods can be partial.",
-    z.object({
-      interval: z.enum(INTERVALS).default("month").describe("day, week, or month"),
-      group_by: z.enum(TREND_DIMS).default("none"),
-      ...rangeParams,
-    }),
+    "Net sales (USD) and orders over time as aligned series: periods (the labels; weeks are labelled by their Monday) and one series per group with net_sales and orders per period, total, and change_pct (last period vs the one before). group_by none gives a single 'All' series; a filter's name gives one series per value of it (a filter with a few values). interval auto fits the range: days up to 2 months, weeks up to 6 months, months beyond. Monthly series end at the last whole month. Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        group_by: splitParam(["none"], "none", MOST_SERIES),
+        interval: z.enum(["auto", ...INTERVALS]).default("auto"),
+        ...frame,
+      }),
     {
       from: "2026-08-01",
       to: "2026-10-31",
@@ -165,14 +364,14 @@ export const salesTools = {
       periods: ["2026-08", "2026-09", "2026-10"],
       series: [
         {
-          name: "apparel",
+          name: "Apparel",
           net_sales: [402_110.4, 438_900.2, 451_220.8],
           orders: [2_210, 2_390, 2_460],
           total: 1_292_231.4,
           change_pct: 2.8,
         },
         {
-          name: "footwear",
+          name: "Footwear",
           net_sales: [281_400.1, 305_220.6, 298_100.3],
           orders: [1_480, 1_610, 1_570],
           total: 884_721.0,
@@ -181,21 +380,35 @@ export const salesTools = {
       ],
     },
     async (args, signal) => {
-      const interval = oneOf(args.interval, INTERVALS, "month");
-      const groupBy = oneOf(args.group_by, TREND_DIMS, "none");
-      const { from, to } = await dateRange(args, 6, { wholeMonths: interval === "month" });
-      return run("trend", { from, to, interval, groupBy }, async () => {
-        const dim = groupBy === "none" ? "'All'" : DIMENSIONS[groupBy as Dimension].sql;
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["none"], "none", MOST_SERIES);
+      const ranged = await withRange(args);
+      let { from, to } = await dateRange(ranged);
+      // Dashboards made before `range` and "auto" expect months when they name no interval.
+      const asked = oneOf(
+        args.interval,
+        ["auto", ...INTERVALS] as const,
+        text(args.range) ? "auto" : "month",
+      );
+      const span = days(from, to);
+      const interval: Interval =
+        asked !== "auto" ? asked : span <= 62 ? "day" : span <= 200 ? "week" : "month";
+      if (interval === "month") ({ from, to } = await dateRange(ranged, 6, { wholeMonths: true }));
+      return run("trend", { from, to, interval, groupBy, ...slice }, async () => {
+        const dim = groupBy === "none" ? "'All'" : splitColumn(groupBy).sql;
+        const filter = sliceWhere(slice, 3);
         const joins =
-          groupBy !== "none" && DIMENSIONS[groupBy as Dimension].products ? PRODUCTS_JOIN : "";
+          filter.products || (groupBy !== "none" && splitColumn(groupBy).products)
+            ? PRODUCTS_JOIN
+            : "";
         const rows = await query(
           `SELECT ${periodExpr(interval, "o.placed_at")} AS period, ${dim} AS name,
                   ${money("oi.line_booked_amount")} AS net_sales,
                   count(DISTINCT o.order_id)::int AS orders
            FROM ${ORDERS_JOIN}${joins}
-           WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1
+           WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}
            GROUP BY 1, 2 ORDER BY 1, 2`,
-          [from, to],
+          [from, to, ...filter.params],
           signal,
         );
         const periods = [...new Set(rows.map((row) => row.period as string))].sort();
@@ -230,12 +443,13 @@ export const salesTools = {
   ),
 
   get_sales_breakdown: dataTool(
-    "Net sales (USD) broken down by one dimension — region, state, category, subcategory, brand, channel (traffic source), or device — for a date range, sorted by net sales: each row's net_sales, share_pct, orders, units, gross_margin_pct, refund_amount and returned_units (returns processed in the range), and return_rate_pct (returned units as a share of units sold).",
-    z.object({
-      dimension: z.enum(BREAKDOWN_DIMS as [Dimension, ...Dimension[]]).default("category"),
-      limit: z.number().int().min(3).max(25).default(10).describe("How many rows, 3 to 25"),
-      ...rangeParams,
-    }),
+    "Net sales (USD) split by one dimension, any filter get_filter_options lists by its name (channel is the order's traffic source), sorted by net sales: each row's name, net_sales, share_pct, orders, units, aov, gross_margin_pct, refund_amount and returned_units (returns processed in the range), and return_rate_pct (returned units as a share of units sold). Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        dimension: splitParam([], "category"),
+        limit: z.number().int().min(3).max(25).default(10).describe("How many rows, 3 to 25"),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
@@ -248,6 +462,7 @@ export const salesTools = {
           share_pct: 33.1,
           orders: 8_610,
           units: 17_820,
+          aov: 199.81,
           gross_margin_pct: 58.4,
           refund_amount: 310_200.7,
           returned_units: 3_580,
@@ -256,12 +471,15 @@ export const salesTools = {
       ],
     },
     async (args, signal) => {
-      const { from, to } = await dateRange(args);
-      const dimension = oneOf(args.dimension, BREAKDOWN_DIMS, "category");
+      const { from, to } = await dateRange(await withRange(args));
+      const slice = await readSlice(args);
+      const dimension = splitOf(args.dimension, [], "category");
       const limit = int(args.limit, 10, 3, 25);
-      return run("breakdown", { from, to, dimension, limit }, async () => {
-        const { sql: dim, products } = DIMENSIONS[dimension];
-        const joins = products ? PRODUCTS_JOIN : "";
+      return run("breakdown", { from, to, dimension, limit, ...slice }, async () => {
+        const { sql: dim, products } = splitColumn(dimension);
+        const filter = sliceWhere(slice, 3);
+        const joins = products || filter.products ? PRODUCTS_JOIN : "";
+        const params = [from, to, ...filter.params];
         const [sales, refunds] = await Promise.all([
           query(
             `SELECT ${dim} AS name, ${money("oi.line_booked_amount")} AS net_sales,
@@ -269,18 +487,18 @@ export const salesTools = {
                     coalesce(sum(oi.ordered_qty), 0)::int AS units,
                     ${money("oi.unit_cogs_at_sale * oi.ordered_qty")} AS cogs
              FROM ${ORDERS_JOIN}${joins}
-             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1
+             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}
              GROUP BY 1 ORDER BY 2 DESC`,
-            [from, to],
+            params,
             signal,
           ),
           query(
             `SELECT ${dim} AS name, ${money("r.product_refund_amount")} AS refund_amount,
                     coalesce(sum(r.returned_qty), 0)::int AS returned_units
              FROM ${RETURNS_JOIN}${joins}
-             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1
+             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1${filter.sql}
              GROUP BY 1`,
-            [from, to],
+            params,
             signal,
           ),
         ]);
@@ -294,13 +512,15 @@ export const salesTools = {
           rows: sales.slice(0, limit).map((row) => {
             const refund = refundsByName.get(row.name as string);
             const units = row.units as number;
+            const orders = row.orders as number;
             const returned = (refund?.returned_units as number) ?? 0;
             return {
               name: row.name,
               net_sales: row.net_sales,
               share_pct: pct(row.net_sales as number, total),
-              orders: row.orders,
+              orders,
               units,
+              aov: orders ? round2((row.net_sales as number) / orders) : 0,
               gross_margin_pct: pct(
                 (row.net_sales as number) - (row.cogs as number),
                 row.net_sales as number,
@@ -316,26 +536,30 @@ export const salesTools = {
   ),
 
   get_top_products: dataTool(
-    "Top products (styles) for a date range ranked by net_sales, units, margin (gross margin %), or return_rate: each row's name, brand, category, subcategory, net_sales (USD), units, orders, gross_margin_pct, refund_amount, and return_rate_pct (returned units / units sold, returns processed in the range). Optional category and brand filters.",
-    z.object({
-      metric: z.enum(["net_sales", "units", "margin", "return_rate"]).default("net_sales"),
-      category: z
-        .string()
-        .optional()
-        .describe("Filter: accessories, apparel, or footwear. Empty for all."),
-      brand: z.string().optional().describe("Filter by brand name. Empty for all."),
-      limit: z.number().int().min(3).max(25).default(10).describe("How many products, 3 to 25"),
-      ...rangeParams,
-    }),
+    "Top products (styles) ranked by net_sales, units, margin (gross margin %) or return_rate: each row's name, brand, category, subcategory, net_sales (USD), units, orders, gross_margin_pct, refund_amount, and return_rate_pct (returned units / units sold, returns processed in the range). group_by a filter's name ranks within each of its values instead: every row then also has group, and there are up to 5 rows per group, the biggest group first (one Table, grouped by that column). Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        metric: z.enum(["net_sales", "units", "margin", "return_rate"]).default("net_sales"),
+        group_by: splitParam(["none"], "none"),
+        limit: z
+          .number()
+          .int()
+          .min(3)
+          .max(25)
+          .optional()
+          .describe("How many products, 3 to 25. Default 10. At most 5 per group."),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
       metric: "net_sales",
+      group_by: "none",
       rows: [
         {
           name: "Alpine Fleece Jacket",
           brand: "Northstar",
-          category: "apparel",
+          category: "Apparel",
           subcategory: "Outerwear",
           net_sales: 148_210.4,
           units: 1_620,
@@ -347,46 +571,51 @@ export const salesTools = {
       ],
     },
     async (args, signal) => {
-      const { from, to } = await dateRange(args);
-      const metric = oneOf(args.metric, ["net_sales", "units", "margin", "return_rate"], "net_sales");
-      // Names are short; anything longer can't match and would only bloat the cache key.
-      const category = text(args.category).toLowerCase().slice(0, 60);
-      const brand = text(args.brand).toLowerCase().slice(0, 60);
-      const limit = int(args.limit, 10, 3, 25);
-      return run("top-products", { from, to, metric, category, brand, limit }, async () => {
-        const filters = `${category ? " AND lower(p.category) = $3" : ""}${brand ? ` AND lower(p.brand) = $${category ? 4 : 3}` : ""}`;
-        const params: unknown[] = [from, to];
-        if (category) params.push(category);
-        if (brand) params.push(brand);
+      const { from, to } = await dateRange(await withRange(args));
+      const metric = oneOf(
+        args.metric,
+        ["net_sales", "units", "margin", "return_rate"],
+        "net_sales",
+      );
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["none"], "none");
+      // A grouped table lists every group, so each gets 5 at most; one group alone gets the full list.
+      const grouped = groupBy !== "none" && !slice[groupBy];
+      const limit = grouped ? Math.min(5, int(args.limit, 5, 3, 25)) : int(args.limit, 10, 3, 25);
+      return run("top-products", { from, to, metric, groupBy, limit, ...slice }, async () => {
+        const { sql: filters, params: values } = sliceWhere(slice, 3);
+        const params = [from, to, ...values];
+        const grp = groupBy === "none" ? "'All'" : splitColumn(groupBy).sql;
         const [sales, refunds] = await Promise.all([
           query(
-            `SELECT p.style_id, p.name, p.brand, p.category, p.subcategory,
+            `SELECT ${grp} AS grp, p.style_id, p.name, p.brand, p.category, p.subcategory,
                     ${money("oi.line_booked_amount")} AS net_sales,
                     coalesce(sum(oi.ordered_qty), 0)::int AS units,
                     count(DISTINCT o.order_id)::int AS orders,
                     ${money("oi.unit_cogs_at_sale * oi.ordered_qty")} AS cogs
              FROM ${ORDERS_JOIN}${PRODUCTS_JOIN}
              WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filters}
-             GROUP BY 1, 2, 3, 4, 5`,
+             GROUP BY 1, 2, 3, 4, 5, 6`,
             params,
             signal,
           ),
           query(
-            `SELECT p.style_id, ${money("r.product_refund_amount")} AS refund_amount,
+            `SELECT ${grp} AS grp, p.style_id, ${money("r.product_refund_amount")} AS refund_amount,
                     coalesce(sum(r.returned_qty), 0)::int AS returned_units
              FROM ${RETURNS_JOIN}${PRODUCTS_JOIN}
              WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1${filters}
-             GROUP BY 1`,
+             GROUP BY 1, 2`,
             params,
             signal,
           ),
         ]);
-        const refundsByStyle = new Map(refunds.map((row) => [row.style_id as string, row]));
+        const refundsByStyle = new Map(refunds.map((row) => [`${row.grp}|${row.style_id}`, row]));
         const rows = sales.map((row) => {
-          const refund = refundsByStyle.get(row.style_id as string);
+          const refund = refundsByStyle.get(`${row.grp}|${row.style_id}`);
           const units = row.units as number;
           const returned = (refund?.returned_units as number) ?? 0;
           return {
+            ...(groupBy !== "none" && { group: row.grp as string }),
             name: row.name,
             brand: row.brand,
             category: row.category,
@@ -409,72 +638,194 @@ export const salesTools = {
           return_rate: (row: (typeof rows)[number]) => row.return_rate_pct,
         }[metric];
         // Rankings by rate only consider products with meaningful volume.
-        const ranked = (metric === "margin" || metric === "return_rate"
-          ? rows.filter((row) => row.units >= 20)
-          : rows
+        const ranked = (
+          metric === "margin" || metric === "return_rate"
+            ? rows.filter((row) => row.units >= 20)
+            : rows
         ).sort((a, b) => key(b) - key(a));
-        return { from, to, metric, rows: ranked.slice(0, limit) };
+        if (groupBy === "none")
+          return {
+            from,
+            to,
+            metric,
+            group_by: groupBy,
+            rows: ranked.slice(0, limit),
+          };
+        // The top `limit` of each group, the group with the most net sales first.
+        const groups = new Map<string, { net: number; rows: typeof rows }>();
+        for (const row of rows) {
+          const group = groups.get(row.group!) ?? { net: 0, rows: [] };
+          group.net += row.net_sales;
+          groups.set(row.group!, group);
+        }
+        for (const row of ranked) {
+          const group = groups.get(row.group!)!;
+          if (group.rows.length < limit) group.rows.push(row);
+        }
+        return {
+          from,
+          to,
+          metric,
+          group_by: groupBy,
+          rows: [...groups.values()].sort((a, b) => b.net - a.net).flatMap((group) => group.rows),
+        };
       });
     },
   ),
 
   get_returns_overview: dataTool(
-    "Returns and refunds for a date range (by the date the return was processed): total refund_amount (USD), returned_units, return_rate_pct (returned units / units sold in the range), restocked_pct, and rows split by reason, category, or month — each with returned_units, refund_amount, and share_pct of returned units.",
-    z.object({
-      by: z.enum(["reason", "category", "month"]).default("reason"),
-      ...rangeParams,
-    }),
+    "Returns and refunds (by the date the return was processed): refund_amount (USD), returned_units, return_rate_pct (returned units / units sold in the range) and restocked_pct for the whole range, previous {refund_amount, returned_units, return_rate_pct} for the range just before (null when it starts before the data), over_time (returned_units, refund_amount and return_rate_pct per period: days, weeks or months, whichever fits the range), and rows split by reason, month or a filter's name: each row's name, returned_units, refund_amount, share_pct of returned units, and (for every split but reason) return_rate_pct, the returned units as a share of that row's units sold. Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        by: splitParam(["reason", "month"], "reason"),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
-      by: "reason",
+      by: "category",
       refund_amount: 948_112.4,
       returned_units: 10_980,
       return_rate_pct: 20.3,
       restocked_pct: 71.4,
+      previous: {
+        refund_amount: 902_480.1,
+        returned_units: 10_410,
+        return_rate_pct: 19.8,
+      },
+      over_time: [
+        {
+          period: "2026-09",
+          returned_units: 1_810,
+          refund_amount: 158_210.4,
+          return_rate_pct: 19.9,
+        },
+        {
+          period: "2026-10",
+          returned_units: 1_920,
+          refund_amount: 166_480.2,
+          return_rate_pct: 20.6,
+        },
+      ],
       rows: [
-        { name: "size_too_large", returned_units: 2_410, refund_amount: 208_110.5, share_pct: 22.0 },
-        { name: "changed_mind", returned_units: 1_980, refund_amount: 171_420.2, share_pct: 18.0 },
+        {
+          name: "Footwear",
+          returned_units: 4_410,
+          refund_amount: 402_110.5,
+          share_pct: 40.2,
+          return_rate_pct: 24.1,
+        },
+        {
+          name: "Apparel",
+          returned_units: 5_080,
+          refund_amount: 441_420.2,
+          share_pct: 46.3,
+          return_rate_pct: 19.2,
+        },
       ],
     },
     async (args, signal) => {
-      const by = oneOf(args.by, ["reason", "category", "month"], "reason");
-      const { from, to } = await dateRange(args, 6, { wholeMonths: by === "month" });
-      return run("returns", { from, to, by }, async () => {
-        const dim = {
-          reason: "coalesce(r.return_reason, 'unknown')",
-          category: "p.category",
-          month: "to_char(date_trunc('month', r.processed_at), 'YYYY-MM')",
-        }[by];
-        const joins = by === "category" ? PRODUCTS_JOIN : "";
-        const [rows, totals, sold] = await Promise.all([
+      const slice = await readSlice(args);
+      const by = splitOf(args.by, ["reason", "month"], "reason");
+      const ranged = await withRange(args);
+      const { from, to } = await dateRange(ranged, 6, {
+        wholeMonths: by === "month",
+      });
+      const series = modern(args) ? await overTime(ranged, from, to) : null;
+      const prev = previousRange(from, to);
+      const comparable = prev.from >= (await dataDays()).first;
+      return run("returns", { from, to, by, series, ...slice }, async () => {
+        const month = (column: string) => `to_char(date_trunc('month', ${column}), 'YYYY-MM')`;
+        // The split, on returns (by when they were processed) and on sales (by when they were placed).
+        const dim =
+          by === "reason"
+            ? "coalesce(r.return_reason, 'unknown')"
+            : by === "month"
+              ? month("r.processed_at")
+              : splitColumn(by).sql;
+        const soldDim =
+          by === "month" ? month("o.placed_at") : by === "reason" ? null : splitColumn(by).sql;
+        const filter = sliceWhere(slice, 3);
+        const sliceJoins = filter.products ? PRODUCTS_JOIN : "";
+        const joins =
+          filter.products || (by !== "reason" && by !== "month" && splitColumn(by).products)
+            ? PRODUCTS_JOIN
+            : "";
+        const params = [from, to, ...filter.params];
+        // Returned units and refunds, and the units sold, over a range.
+        const whole = (range: string[]) =>
+          Promise.all([
+            query(
+              `SELECT coalesce(sum(r.returned_qty), 0)::int AS returned_units,
+                      ${money("r.product_refund_amount")} AS refund_amount,
+                      coalesce(sum(r.returned_qty) FILTER (WHERE r.restocked_flag), 0)::int AS restocked
+               FROM ${RETURNS_JOIN}${sliceJoins}
+               WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1${filter.sql}`,
+              [...range, ...filter.params],
+              signal,
+            ),
+            query(
+              `SELECT coalesce(sum(oi.ordered_qty), 0)::int AS units
+               FROM ${ORDERS_JOIN}${sliceJoins}
+               WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}`,
+              [...range, ...filter.params],
+              signal,
+            ),
+          ]);
+        // Returns by when they were processed and units sold by when they were placed, per period.
+        const periods = series
+          ? Promise.all([
+              query(
+                `SELECT ${periodExpr(series.interval, "r.processed_at")} AS period,
+                        coalesce(sum(r.returned_qty), 0)::int AS returned_units,
+                        ${money("r.product_refund_amount")} AS refund_amount
+                 FROM ${RETURNS_JOIN}${sliceJoins}
+                 WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1${filter.sql}
+                 GROUP BY 1 ORDER BY 1`,
+                [series.from, series.to, ...filter.params],
+                signal,
+              ),
+              query(
+                `SELECT ${periodExpr(series.interval, "o.placed_at")} AS period,
+                        coalesce(sum(oi.ordered_qty), 0)::int AS units
+                 FROM ${ORDERS_JOIN}${sliceJoins}
+                 WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}
+                 GROUP BY 1`,
+                [series.from, series.to, ...filter.params],
+                signal,
+              ),
+            ])
+          : null;
+        const [rows, [totals, sold], before, soldBy, overTimeRows] = await Promise.all([
           query(
             `SELECT ${dim} AS name, coalesce(sum(r.returned_qty), 0)::int AS returned_units,
                     ${money("r.product_refund_amount")} AS refund_amount
              FROM ${RETURNS_JOIN}${joins}
-             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1
+             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1${filter.sql}
              GROUP BY 1 ORDER BY ${by === "month" ? "1" : "2 DESC"}`,
-            [from, to],
+            params,
             signal,
           ),
-          query(
-            `SELECT coalesce(sum(r.returned_qty), 0)::int AS returned_units,
-                    ${money("r.product_refund_amount")} AS refund_amount,
-                    coalesce(sum(r.returned_qty) FILTER (WHERE r.restocked_flag), 0)::int AS restocked
-             FROM ${RETURNS_JOIN}
-             WHERE ${SALES_WHERE} AND r.processed_at >= $1::date AND r.processed_at < $2::date + 1`,
-            [from, to],
-            signal,
-          ),
-          query(
-            `SELECT coalesce(sum(oi.ordered_qty), 0)::int AS units
-             FROM ${ORDERS_JOIN}
-             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1`,
-            [from, to],
-            signal,
-          ),
+          whole([from, to]),
+          comparable ? whole([prev.from, prev.to]) : null,
+          soldDim
+            ? query(
+                `SELECT ${soldDim} AS name, coalesce(sum(oi.ordered_qty), 0)::int AS units
+                 FROM ${ORDERS_JOIN}${joins}
+                 WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}
+                 GROUP BY 1`,
+                params,
+                signal,
+              )
+            : [],
+          periods,
         ]);
         const total = totals[0] as Record<string, number>;
+        const was = before?.[0][0] as Record<string, number> | undefined;
+        const soldIn = new Map(
+          (overTimeRows?.[1] ?? []).map((row) => [row.period as string, row.units as number]),
+        );
+        const unitsSold = new Map(soldBy.map((row) => [row.name as string, row.units as number]));
         return {
           from,
           to,
@@ -483,11 +834,39 @@ export const salesTools = {
           returned_units: total.returned_units,
           return_rate_pct: pct(total.returned_units, (sold[0]?.units as number) ?? 0),
           restocked_pct: pct(total.restocked, total.returned_units),
+          previous: was
+            ? {
+                refund_amount: was.refund_amount,
+                returned_units: was.returned_units,
+                return_rate_pct: pct(was.returned_units, (before?.[1][0]?.units as number) ?? 0),
+              }
+            : {
+                refund_amount: null,
+                returned_units: null,
+                return_rate_pct: null,
+              },
+          ...(overTimeRows && {
+            over_time: overTimeRows[0].map((row) => ({
+              period: row.period,
+              returned_units: row.returned_units,
+              refund_amount: row.refund_amount,
+              return_rate_pct: pct(
+                row.returned_units as number,
+                soldIn.get(row.period as string) ?? 0,
+              ),
+            })),
+          }),
           rows: rows.map((row) => ({
             name: row.name,
             returned_units: row.returned_units,
             refund_amount: row.refund_amount,
             share_pct: pct(row.returned_units as number, total.returned_units),
+            ...(soldDim && {
+              return_rate_pct: pct(
+                row.returned_units as number,
+                unitsSold.get(row.name as string) ?? 0,
+              ),
+            }),
           })),
         };
       });
@@ -495,76 +874,294 @@ export const salesTools = {
   ),
 
   get_targets_vs_actuals: dataTool(
-    "Monthly net sales against the approved sales targets, for the whole business or per region or category: one row per month and scope with target (USD), actual (net sales minus refunds processed that month), and attainment_pct. Months run up to the last whole month of data.",
+    "Net sales against the approved monthly sales targets, for the whole business (scope business), each region, or each category. total: target, actual (net sales minus refunds processed), gap (actual minus target), attainment_pct, net_sales (before refunds) and refunds over the whole range, for headline numbers. previous: the same for the months just before (null when they start before the data). totals: the same per scope over the whole range, for a bar or table per region or category. over_time: one row per month (period and the same figures) summed over the scopes, for target against actual over time. rows: one per month and scope, for a month-by-scope grid. periods and series: those months as aligned series, one per scope (its name, and target, actual, gap and attainment_pct per period), for a line per region or category over time. over_time, rows and series reach back at least 6 months, so a short range still shows a trend. Targets are monthly, so the range counts whole months up to the last whole month, and they aren't set per brand or channel. Follows the range filter, and a region or a category filter, never both: scope region and scope business follow region, scope category and scope business follow category, so a dashboard's region or category filter goes into every call that follows it. The other one changes nothing here: targets aren't set for a category within a region, so targets by region can't be narrowed to a category, nor targets by category to a region.",
     z.object({
-      scope: z
-        .enum(["business", "region", "category"])
-        .default("business")
-        .describe("business: one row per month; region/category: one row per month and scope"),
-      months: z.number().int().min(1).max(24).default(6).describe("How many months back, 1 to 24"),
+      scope: z.enum(["business", "region", "category"]).default("business"),
+      range,
+      region: filterParam("Region"),
+      category: filterParam("Category"),
     }),
     {
       scope: "region",
+      total: {
+        target: 1_680_000,
+        actual: 1_673_180.6,
+        gap: -6_819.4,
+        attainment_pct: 99.6,
+        net_sales: 1_812_400.9,
+        refunds: 139_220.3,
+      },
+      previous: {
+        target: 1_590_000,
+        actual: 1_548_220.3,
+        gap: -41_779.7,
+        attainment_pct: 97.4,
+        net_sales: 1_677_930.5,
+        refunds: 129_710.2,
+      },
+      totals: [
+        {
+          scope: "West",
+          target: 960_000,
+          actual: 921_300.4,
+          gap: -38_699.6,
+          attainment_pct: 96.0,
+          net_sales: 998_120.7,
+          refunds: 76_820.3,
+        },
+        {
+          scope: "South",
+          target: 720_000,
+          actual: 751_880.2,
+          gap: 31_880.2,
+          attainment_pct: 104.4,
+          net_sales: 814_280.2,
+          refunds: 62_400,
+        },
+      ],
+      over_time: [
+        {
+          period: "2026-09",
+          target: 540_000,
+          actual: 529_310.4,
+          gap: -10_689.6,
+          attainment_pct: 98.0,
+          net_sales: 573_420.1,
+          refunds: 44_109.7,
+        },
+        {
+          period: "2026-10",
+          target: 560_000,
+          actual: 563_610.9,
+          gap: 3_610.9,
+          attainment_pct: 100.6,
+          net_sales: 610_530.4,
+          refunds: 46_919.5,
+        },
+      ],
       rows: [
-        { month: "2026-10", scope: "West", target: 320_000, actual: 301_410.8, attainment_pct: 94.2 },
-        { month: "2026-10", scope: "South", target: 240_000, actual: 262_200.1, attainment_pct: 109.3 },
+        {
+          month: "2026-10",
+          scope: "West",
+          target: 320_000,
+          actual: 301_410.8,
+          gap: -18_589.2,
+          attainment_pct: 94.2,
+          net_sales: 326_530.2,
+          refunds: 25_119.4,
+        },
+        {
+          month: "2026-10",
+          scope: "South",
+          target: 240_000,
+          actual: 262_200.1,
+          gap: 22_200.1,
+          attainment_pct: 109.3,
+          net_sales: 284_000.2,
+          refunds: 21_800.1,
+        },
+      ],
+      periods: ["2026-09", "2026-10"],
+      series: [
+        {
+          name: "West",
+          target: [310_000, 320_000],
+          actual: [298_120.3, 301_410.8],
+          gap: [-11_879.7, -18_589.2],
+          attainment_pct: [96.2, 94.2],
+        },
+        {
+          name: "South",
+          target: [230_000, 240_000],
+          actual: [231_190.1, 262_200.1],
+          gap: [1_190.1, 22_200.1],
+          attainment_pct: [100.5, 109.3],
+        },
       ],
     },
     async (args, signal) => {
-      const scope = oneOf(args.scope, ["business", "region", "category"], "business");
-      const months = int(args.months, 6, 1, 24);
+      let scope = oneOf(args.scope, ["business", "region", "category"], "business");
+      const region = sliceValue(args.region);
+      const category = sliceValue(args.category);
+      // A filter needs rows at its level: a whole-business query with a region (or category)
+      // filter reads that region's targets. Targets have no region × category level, so the
+      // filter matching the scope wins.
+      if (scope === "business") scope = region ? "region" : category ? "category" : "business";
+      const only = scope === "region" ? region : scope === "category" ? category : "";
       const { monthEnd } = await dataDays();
-      return run("targets", { scope, months, monthEnd }, async () => {
-        const dim = { business: "'ALL'", region: "o.shipping_region", category: "p.category" }[
-          scope
-        ];
+      // Targets are monthly up to the last whole month: a date filter's range counts as the whole
+      // months from its start to there (a range ending earlier still ends at the last whole month).
+      const ranged = await withRange(args);
+      const start = /^\d{4}-\d{2}-\d{2}$/.test(text(ranged.from)) ? text(ranged.from) : "";
+      // A range that ends earlier, such as exact dates, ends at the last whole month in it, or,
+      // when it is shorter than a month, at the end of the month it ends in.
+      const to = /^\d{4}-\d{2}-\d{2}$/.test(text(ranged.to)) ? text(ranged.to) : "";
+      const monthDay = (day: string, shift: number) =>
+        new Date(Date.UTC(Number(day.slice(0, 4)), Number(day.slice(5, 7)) + shift, 0))
+          .toISOString()
+          .slice(0, 10);
+      const end =
+        !to || to >= monthEnd
+          ? monthEnd
+          : monthDay(to, 0) === to || monthDay(to, -1) < (start || to)
+            ? monthDay(to, 0)
+            : monthDay(to, -1);
+      const months = start
+        ? Math.min(
+            24,
+            Math.max(
+              1,
+              (Number(end.slice(0, 4)) - Number(start.slice(0, 4))) * 12 +
+                Number(end.slice(5, 7)) -
+                Number(start.slice(5, 7)) +
+                1,
+            ),
+          )
+        : int(ranged.months, 6, 1, 24);
+      // The same number of months just before, when the data reaches that far back.
+      const firstMonth = new Date(
+        Date.UTC(Number(end.slice(0, 4)), Number(end.slice(5, 7)) - months, 1),
+      );
+      const before = new Date(firstMonth.getTime() - 86_400_000).toISOString().slice(0, 10);
+      const beforeStart = new Date(
+        Date.UTC(firstMonth.getUTCFullYear(), firstMonth.getUTCMonth() - months, 1),
+      )
+        .toISOString()
+        .slice(0, 10);
+      const comparable = beforeStart >= `${(await dataDays()).first.slice(0, 7)}-01`;
+      // A short range still shows a trend: over_time and rows reach back to 6 months. Dashboards
+      // made before `range` get the months they asked for.
+      const span = modern(args) ? Math.max(months, 6) : months;
+      const rangeStart = firstMonth.toISOString().slice(0, 7);
+      type Sum = { target: number; net_sales: number; refunds: number };
+      /** A target against what sold: actual is net sales minus refunds, gap is actual minus target. */
+      const figures = ({ target, net_sales, refunds }: Sum) => {
+        const actual = round2(net_sales - refunds);
+        return {
+          target: round2(target),
+          actual,
+          gap: round2(actual - target),
+          attainment_pct: pct(actual, target),
+          net_sales: round2(net_sales),
+          refunds: round2(refunds),
+        };
+      };
+      const add = (list: readonly Sum[]): Sum =>
+        list.reduce<Sum>(
+          (sum, row) => ({
+            target: sum.target + row.target,
+            net_sales: sum.net_sales + row.net_sales,
+            refunds: sum.refunds + row.refunds,
+          }),
+          { target: 0, net_sales: 0, refunds: 0 },
+        );
+      /** The rows of each month or scope, in the order the rows first name them. */
+      const groups = <Row extends Sum>(list: readonly Row[], key: (row: Row) => string) => {
+        const map = new Map<string, Row[]>();
+        for (const row of list) map.set(key(row), [...(map.get(key(row)) ?? []), row]);
+        return [...map];
+      };
+      return run("targets", { scope, months, span, end, only }, async () => {
+        const dim = {
+          business: "'ALL'",
+          region: "o.shipping_region",
+          category: "p.category",
+        }[scope];
         const joins = scope === "category" ? PRODUCTS_JOIN : "";
-        // The first day of the earliest month: `months` whole months up to the last whole month.
+        // The first day of the earliest month: `count` whole months up to the month of `end`.
         const since = "date_trunc('month', $1::date) - make_interval(months => $2 - 1)";
-        const [targets, sales, refunds] = await Promise.all([
-          query(
-            `SELECT to_char(month_start, 'YYYY-MM') AS month, scope_id AS scope,
+        /** One row per month and scope, for the `count` months ending with `end`'s. */
+        const load = async (end: string, count: number) => {
+          const [targets, sales, refunds] = await Promise.all([
+            query(
+              `SELECT to_char(month_start, 'YYYY-MM') AS month, scope_id AS scope,
                     round(net_sales_target::numeric, 2)::float8 AS target
              FROM retail.sales_targets
              WHERE scope_type = $3 AND month_start >= ${since} AND month_start <= $1::date
              ORDER BY 1, 2`,
-            [monthEnd, months, scope],
-            signal,
-          ),
-          query(
-            `SELECT to_char(date_trunc('month', o.placed_at), 'YYYY-MM') AS month, ${dim} AS scope,
+              [end, count, scope],
+              signal,
+            ),
+            query(
+              `SELECT to_char(date_trunc('month', o.placed_at), 'YYYY-MM') AS month, ${dim} AS scope,
                     ${money("oi.line_booked_amount")} AS booked
              FROM ${ORDERS_JOIN}${joins}
              WHERE ${SALES_WHERE} AND o.placed_at >= ${since} AND o.placed_at < $1::date + 1
              GROUP BY 1, 2`,
-            [monthEnd, months],
-            signal,
-          ),
-          query(
-            `SELECT to_char(date_trunc('month', r.processed_at), 'YYYY-MM') AS month, ${dim} AS scope,
+              [end, count],
+              signal,
+            ),
+            query(
+              `SELECT to_char(date_trunc('month', r.processed_at), 'YYYY-MM') AS month, ${dim} AS scope,
                     ${money("r.product_refund_amount")} AS refunds
              FROM ${RETURNS_JOIN}${joins}
              WHERE ${SALES_WHERE} AND r.processed_at >= ${since} AND r.processed_at < $1::date + 1
              GROUP BY 1, 2`,
-            [monthEnd, months],
-            signal,
-          ),
+              [end, count],
+              signal,
+            ),
+          ]);
+          const booked = new Map(
+            sales.map((row) => [`${row.month}|${row.scope}`, row.booked as number]),
+          );
+          const refunded = new Map(
+            refunds.map((row) => [`${row.month}|${row.scope}`, row.refunds as number]),
+          );
+          return targets
+            .filter((row) => !only || String(row.scope).toLowerCase() === only)
+            .map((row) => {
+              const key = `${row.month}|${row.scope}`;
+              return {
+                month: row.month as string,
+                scope: row.scope as string,
+                ...figures({
+                  target: row.target as number,
+                  net_sales: booked.get(key) ?? 0,
+                  refunds: refunded.get(key) ?? 0,
+                }),
+              };
+            });
+        };
+        const [trend, earlier] = await Promise.all([
+          load(end, span),
+          comparable ? load(before, months) : null,
         ]);
-        const booked = new Map(sales.map((row) => [`${row.month}|${row.scope}`, row.booked as number]));
-        const refunded = new Map(
-          refunds.map((row) => [`${row.month}|${row.scope}`, row.refunds as number]),
-        );
+        // The headline and each scope count the range's own months; the trend may start earlier.
+        const inRange = trend.filter((row) => row.month >= rangeStart);
+        const periods = [...new Set(trend.map((row) => row.month))];
         return {
           scope,
-          rows: targets.map((row) => {
-            const key = `${row.month}|${row.scope}`;
-            const actual = round2((booked.get(key) ?? 0) - (refunded.get(key) ?? 0));
+          total: figures(add(inRange)),
+          previous: earlier
+            ? figures(add(earlier))
+            : {
+                target: null,
+                actual: null,
+                gap: null,
+                attainment_pct: null,
+                net_sales: null,
+                refunds: null,
+              },
+          totals: groups(inRange, (row) => row.scope).map(([name, list]) => ({
+            scope: name,
+            ...figures(add(list)),
+          })),
+          over_time: groups(trend, (row) => row.month).map(([period, list]) => ({
+            period,
+            ...figures(add(list)),
+          })),
+          rows: trend,
+          periods,
+          series: groups(trend, (row) => row.scope).map(([name, list]) => {
+            const at = new Map(list.map((row) => [row.month, row]));
+            const each = (key: "target" | "actual" | "gap" | "attainment_pct") =>
+              periods.map((period) => at.get(period)?.[key] ?? null);
             return {
-              month: row.month,
-              scope: row.scope,
-              target: row.target,
-              actual,
-              attainment_pct: pct(actual, row.target as number),
+              name,
+              target: each("target"),
+              actual: each("actual"),
+              gap: each("gap"),
+              attainment_pct: each("attainment_pct"),
             };
           }),
         };
@@ -573,14 +1170,35 @@ export const salesTools = {
   ),
 
   get_customer_insights: dataTool(
-    "Customers per month for a date range: new_customers (first-ever order that month), returning_customers (ordered that month, first order earlier), orders and net_sales (USD) — plus new customers in the whole range by acquisition channel. Good for new-vs-returning and acquisition dashboards.",
-    z.object({ ...rangeParams }),
+    "Customers who ordered in the range: customers, new_customers (first-ever order in the range), returning_customers (first ordered before it), new_share_pct, repeat_rate_pct (the share who ordered more than once in the range), orders, net_sales (USD), aov and orders_per_customer; previous {customers, new_customers, orders, net_sales} for the range just before (null when it starts before the data); over_time, new_customers, returning_customers, orders and net_sales per period (days, weeks or months, whichever fits the range); new_by_channel, new customers by acquisition channel; and rows, the same counts split by group_by (a filter's name: customers who ordered in each). Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        group_by: splitParam(["none"], "none").describe(
+          "What rows are split by. none leaves rows empty.",
+        ),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
-      months: [
+      customers: 18_420,
+      new_customers: 9_840,
+      returning_customers: 8_580,
+      new_share_pct: 53.4,
+      repeat_rate_pct: 28.6,
+      orders: 26_410,
+      net_sales: 5_204_310.5,
+      aov: 197.06,
+      orders_per_customer: 1.43,
+      previous: {
+        customers: 17_210,
+        new_customers: 9_020,
+        orders: 24_870,
+        net_sales: 4_890_200.1,
+      },
+      over_time: [
         {
-          month: "2026-10",
+          period: "2026-10",
           new_customers: 1_840,
           returning_customers: 2_410,
           orders: 4_874,
@@ -588,55 +1206,192 @@ export const salesTools = {
         },
       ],
       new_by_channel: [
-        { channel: "paid_search", customers: 2_310 },
-        { channel: "organic_search", customers: 1_980 },
+        { channel: "Paid search", customers: 2_310 },
+        { channel: "Organic search", customers: 1_980 },
+      ],
+      group_by: "region",
+      rows: [
+        {
+          name: "West",
+          customers: 6_110,
+          new_customers: 3_240,
+          returning_customers: 2_870,
+          new_share_pct: 53.0,
+          repeat_rate_pct: 27.9,
+          orders: 8_610,
+          net_sales: 1_720_410.2,
+          aov: 199.81,
+          orders_per_customer: 1.41,
+        },
       ],
     },
     async (args, signal) => {
-      const { from, to } = await dateRange(args, 12, { wholeMonths: true });
-      return run("customers", { from, to }, async () => {
-        const [months, channels] = await Promise.all([
+      const ranged = await withRange(args);
+      // With `range`, the same dates as the other tools' headline numbers; whole months before it.
+      const { from, to } = await dateRange(ranged, 12, {
+        wholeMonths: !modern(args),
+      });
+      const series = modern(args)
+        ? await overTime(ranged, from, to)
+        : { interval: "month" as Interval, from, to };
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["none"], "none");
+      const prev = previousRange(from, to);
+      const comparable = prev.from >= (await dataDays()).first;
+      return run("customers", { from, to, groupBy, series, ...slice }, async () => {
+        const filter = sliceWhere(slice, 3);
+        const params = [from, to, ...filter.params];
+        // Per `dim`: its customers, those whose first-ever order is in the range, and those who
+        // ordered more than once in it. One row per customer first, then counted.
+        const counts = (dim: string, products: boolean, range = [from, to]) =>
           query(
-            `SELECT to_char(date_trunc('month', o.placed_at), 'YYYY-MM') AS month,
+            `SELECT name, count(*)::int AS customers,
+                    count(*) FILTER (WHERE fresh)::int AS new_customers,
+                    count(*) FILTER (WHERE orders > 1)::int AS repeat_customers,
+                    coalesce(sum(orders), 0)::int AS orders,
+                    coalesce(round(sum(net)::numeric, 2), 0)::float8 AS net_sales
+             FROM (
+               SELECT ${dim} AS name, o.customer_id,
+                      bool_or(c.first_ever_order_at >= $1::date AND c.first_ever_order_at < $2::date + 1) AS fresh,
+                      count(DISTINCT o.order_id) AS orders,
+                      sum(oi.line_booked_amount) AS net
+               FROM ${ORDERS_JOIN}${products || filter.products ? PRODUCTS_JOIN : ""}
+               WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}
+               GROUP BY 1, 2
+             ) per_customer
+             GROUP BY 1 ORDER BY 2 DESC`,
+            [...range, ...filter.params],
+            signal,
+          );
+        const joins = filter.products ? PRODUCTS_JOIN : "";
+        const [all, before, groups, months, channels] = await Promise.all([
+          counts("'All'", false),
+          comparable ? counts("'All'", false, [prev.from, prev.to]) : null,
+          groupBy === "none" ? [] : counts(splitColumn(groupBy).sql, splitColumn(groupBy).products),
+          // Per period: customers whose first-ever order falls in it, and those who had one before it.
+          query(
+            `SELECT ${periodExpr(series.interval, "o.placed_at")} AS period,
                     count(DISTINCT o.customer_id) FILTER (
-                      WHERE date_trunc('month', c.first_ever_order_at) = date_trunc('month', o.placed_at)
+                      WHERE date_trunc('${series.interval}', c.first_ever_order_at) = date_trunc('${series.interval}', o.placed_at)
                     )::int AS new_customers,
                     count(DISTINCT o.customer_id) FILTER (
-                      WHERE c.first_ever_order_at < date_trunc('month', o.placed_at)
+                      WHERE c.first_ever_order_at < date_trunc('${series.interval}', o.placed_at)
                     )::int AS returning_customers,
                     count(DISTINCT o.order_id)::int AS orders,
                     ${money("oi.line_booked_amount")} AS net_sales
-             FROM ${ORDERS_JOIN}
-             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1
+             FROM ${ORDERS_JOIN}${joins}
+             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}
              GROUP BY 1 ORDER BY 1`,
-            [from, to],
+            [series.from, series.to, ...filter.params],
             signal,
           ),
-          query(
-            `SELECT coalesce(c.acquisition_channel, 'unknown') AS channel,
-                    count(*)::int AS customers
-             FROM retail.customers c
-             WHERE NOT c.is_internal
-               AND c.first_ever_order_at >= $1::date AND c.first_ever_order_at < $2::date + 1
-             GROUP BY 1 ORDER BY 2 DESC`,
-            [from, to],
-            signal,
-          ),
+          filter.params.length
+            ? // New customers whose first order (the same day as their first-ever order) is in the slice.
+              query(
+                `SELECT coalesce(c.acquisition_channel, 'unknown') AS channel,
+                        count(DISTINCT c.customer_id)::int AS customers
+                 FROM ${ORDERS_JOIN}${joins}
+                 WHERE ${SALES_WHERE}
+                   AND c.first_ever_order_at >= $1::date AND c.first_ever_order_at < $2::date + 1
+                   AND o.placed_at::date = c.first_ever_order_at::date${filter.sql}
+                 GROUP BY 1 ORDER BY 2 DESC`,
+                params,
+                signal,
+              )
+            : query(
+                `SELECT coalesce(c.acquisition_channel, 'unknown') AS channel,
+                        count(*)::int AS customers
+                 FROM retail.customers c
+                 WHERE NOT c.is_internal
+                   AND c.first_ever_order_at >= $1::date AND c.first_ever_order_at < $2::date + 1
+                 GROUP BY 1 ORDER BY 2 DESC`,
+                [from, to],
+                signal,
+              ),
         ]);
-        return { from, to, months, new_by_channel: channels };
+        const shape = (row: Record<string, unknown> | undefined) => {
+          const customers = (row?.customers as number) ?? 0;
+          const fresh = (row?.new_customers as number) ?? 0;
+          const repeat = (row?.repeat_customers as number) ?? 0;
+          const orders = (row?.orders as number) ?? 0;
+          const netSales = (row?.net_sales as number) ?? 0;
+          return {
+            customers,
+            new_customers: fresh,
+            returning_customers: customers - fresh,
+            new_share_pct: pct(fresh, customers),
+            repeat_rate_pct: pct(repeat, customers),
+            orders,
+            net_sales: netSales,
+            aov: orders ? round2(netSales / orders) : 0,
+            orders_per_customer: customers ? round2(orders / customers) : 0,
+          };
+        };
+        const total = shape(all[0]);
+        const was = before ? shape(before[0]) : null;
+        return {
+          from,
+          to,
+          customers: total.customers,
+          new_customers: total.new_customers,
+          returning_customers: total.returning_customers,
+          new_share_pct: total.new_share_pct,
+          repeat_rate_pct: total.repeat_rate_pct,
+          orders: total.orders,
+          net_sales: total.net_sales,
+          aov: total.aov,
+          orders_per_customer: total.orders_per_customer,
+          previous: {
+            customers: was?.customers ?? null,
+            new_customers: was?.new_customers ?? null,
+            orders: was?.orders ?? null,
+            net_sales: was?.net_sales ?? null,
+          },
+          // Dashboards made before `range` read these as `months`, each with its `month`.
+          ...(modern(args)
+            ? { over_time: months }
+            : {
+                months: months.map(({ period, ...row }) => ({
+                  month: period,
+                  ...row,
+                })),
+              }),
+          new_by_channel: channels,
+          group_by: groupBy,
+          rows: groups.map((row) => ({ name: row.name, ...shape(row) })),
+        };
       });
     },
   ),
 
   get_promotions_performance: dataTool(
-    "Promotion performance for a date range, by promo code: orders that used it, discount_amount given (USD), net_sales of those orders, and discount_share_pct (discount as a share of those orders' pre-discount revenue). Sorted by discount amount.",
-    z.object({ ...rangeParams }),
+    "Promotion performance: promo_orders (orders that used a promo code), promo_order_share_pct (their share of all orders), discount_amount given (USD), promo_net_sales (net sales of those orders) and discount_share_pct (discount as a share of those orders' pre-discount revenue) for the whole range, previous {promo_orders, discount_amount, promo_net_sales} for the range just before (null when it starts before the data), over_time (promo_orders and discount_amount per period: days, weeks or months, whichever fits the range), and rows split by group_by: code (each promo code, the default) or a filter's name, each with name, orders, discount_amount, net_sales and discount_share_pct, sorted by discount amount. Follows the range filter and every filter get_filter_options lists.",
+    () =>
+      following({
+        group_by: splitParam(["code"], "code"),
+        ...frame,
+      }),
     {
       from: "2026-05-10",
       to: "2026-11-09",
+      promo_orders: 6_210,
+      promo_order_share_pct: 23.5,
+      discount_amount: 312_480.2,
+      promo_net_sales: 1_402_110.9,
+      discount_share_pct: 18.2,
+      previous: {
+        promo_orders: 5_870,
+        discount_amount: 298_110.4,
+        promo_net_sales: 1_340_220.3,
+      },
+      over_time: [
+        { period: "2026-09", promo_orders: 980, discount_amount: 49_210.4 },
+        { period: "2026-10", promo_orders: 1_120, discount_amount: 56_480.2 },
+      ],
+      group_by: "code",
       rows: [
         {
-          code: "FALL20",
+          name: "FALL20",
           orders: 1_240,
           discount_amount: 86_410.2,
           net_sales: 402_110.9,
@@ -645,50 +1400,184 @@ export const salesTools = {
       ],
     },
     async (args, signal) => {
-      const { from, to } = await dateRange(args);
-      return run("promotions", { from, to }, async () => {
-        const [discounts, sales] = await Promise.all([
+      const ranged = await withRange(args);
+      const { from, to } = await dateRange(ranged);
+      const series = modern(args) ? await overTime(ranged, from, to) : null;
+      const slice = await readSlice(args);
+      const groupBy = splitOf(args.group_by, ["code"], "code");
+      const prev = previousRange(from, to);
+      const comparable = prev.from >= (await dataDays()).first;
+      return run("promotions", { from, to, groupBy, series, ...slice }, async () => {
+        const filter = sliceWhere(slice, 3);
+        const params = [from, to, ...filter.params];
+        const placed = `${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1${filter.sql}`;
+        // Promo orders, the discount they were given and their net sales, per `dim`. Discounts are
+        // allocated to order items, so a product split or filter keeps those items' share.
+        const promos = async (
+          dim: string,
+          products: boolean,
+          byCode: boolean,
+          range = [from, to],
+        ) => {
+          const items = products || filter.products;
+          const params = [...range, ...filter.params];
+          const [discounts, sales] = await Promise.all([
+            query(
+              `SELECT ${dim} AS name, count(DISTINCT op.order_id)::int AS orders,
+                      ${money("op.allocated_discount")} AS discount_amount
+               FROM retail.order_promotions op
+               JOIN retail.promotions pr ON pr.promotion_id = op.promotion_id
+               JOIN retail.orders o ON o.order_id = op.order_id
+               JOIN retail.customers c ON c.customer_id = o.customer_id${
+                 items
+                   ? `\n               JOIN retail.order_items oi ON oi.order_item_id = op.order_item_id${PRODUCTS_JOIN}`
+                   : ""
+               }
+               WHERE ${placed}
+               GROUP BY 1 ORDER BY 3 DESC`,
+              params,
+              signal,
+            ),
+            query(
+              `SELECT ${dim} AS name, ${money("oi.line_booked_amount")} AS net_sales
+               FROM (SELECT DISTINCT op.order_id${byCode ? ", op.promotion_id" : ""}
+                     FROM retail.order_promotions op) x${
+                       byCode
+                         ? "\n               JOIN retail.promotions pr ON pr.promotion_id = x.promotion_id"
+                         : ""
+                     }
+               JOIN retail.orders o ON o.order_id = x.order_id
+               JOIN retail.customers c ON c.customer_id = o.customer_id
+               JOIN retail.order_items oi ON oi.order_id = o.order_id${items ? PRODUCTS_JOIN : ""}
+               WHERE ${placed}
+               GROUP BY 1`,
+              params,
+              signal,
+            ),
+          ]);
+          const salesByName = new Map(
+            sales.map((row) => [row.name as string, row.net_sales as number]),
+          );
+          return discounts.map((row) => {
+            const net = salesByName.get(row.name as string) ?? 0;
+            const discount = row.discount_amount as number;
+            return {
+              name: row.name as string,
+              orders: row.orders as number,
+              discount_amount: discount,
+              net_sales: net,
+              discount_share_pct: pct(discount, net + discount),
+            };
+          });
+        };
+        const [rows, all, before, orders, periods] = await Promise.all([
+          groupBy === "code"
+            ? promos("pr.code", false, true)
+            : promos(splitColumn(groupBy).sql, splitColumn(groupBy).products, false),
+          promos("'All'", false, false),
+          comparable ? promos("'All'", false, false, [prev.from, prev.to]) : null,
           query(
-            `SELECT pr.code, count(DISTINCT op.order_id)::int AS orders,
-                    ${money("op.allocated_discount")} AS discount_amount
-             FROM retail.order_promotions op
-             JOIN retail.promotions pr ON pr.promotion_id = op.promotion_id
-             JOIN retail.orders o ON o.order_id = op.order_id
-             JOIN retail.customers c ON c.customer_id = o.customer_id
-             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1
-             GROUP BY 1 ORDER BY 3 DESC`,
-            [from, to],
+            `SELECT count(DISTINCT o.order_id)::int AS orders
+             FROM ${ORDERS_JOIN}${filter.products ? PRODUCTS_JOIN : ""}
+             WHERE ${placed}`,
+            params,
             signal,
           ),
-          query(
-            `SELECT pr.code, ${money("oi.line_booked_amount")} AS net_sales
-             FROM (SELECT DISTINCT op.order_id, op.promotion_id FROM retail.order_promotions op) x
-             JOIN retail.promotions pr ON pr.promotion_id = x.promotion_id
-             JOIN retail.orders o ON o.order_id = x.order_id
-             JOIN retail.customers c ON c.customer_id = o.customer_id
-             JOIN retail.order_items oi ON oi.order_id = o.order_id
-             WHERE ${SALES_WHERE} AND o.placed_at >= $1::date AND o.placed_at < $2::date + 1
-             GROUP BY 1`,
-            [from, to],
-            signal,
-          ),
+          series
+            ? query(
+                `SELECT ${periodExpr(series.interval, "o.placed_at")} AS period,
+                        count(DISTINCT op.order_id)::int AS promo_orders,
+                        ${money("op.allocated_discount")} AS discount_amount
+                 FROM retail.order_promotions op
+                 JOIN retail.orders o ON o.order_id = op.order_id
+                 JOIN retail.customers c ON c.customer_id = o.customer_id${
+                   filter.products
+                     ? `\n                 JOIN retail.order_items oi ON oi.order_item_id = op.order_item_id${PRODUCTS_JOIN}`
+                     : ""
+                 }
+                 WHERE ${placed}
+                 GROUP BY 1 ORDER BY 1`,
+                [series.from, series.to, ...filter.params],
+                signal,
+              )
+            : null,
         ]);
-        const salesByCode = new Map(sales.map((row) => [row.code as string, row.net_sales as number]));
+        const total = all[0] ?? {
+          orders: 0,
+          discount_amount: 0,
+          net_sales: 0,
+          discount_share_pct: 0,
+        };
         return {
           from,
           to,
-          rows: discounts.map((row) => {
-            const net = salesByCode.get(row.code as string) ?? 0;
-            return {
-              code: row.code,
-              orders: row.orders,
-              discount_amount: row.discount_amount,
-              net_sales: net,
-              discount_share_pct: pct(row.discount_amount as number, net + (row.discount_amount as number)),
-            };
-          }),
+          promo_orders: total.orders,
+          promo_order_share_pct: pct(total.orders, (orders[0]?.orders as number) ?? 0),
+          discount_amount: total.discount_amount,
+          promo_net_sales: total.net_sales,
+          discount_share_pct: total.discount_share_pct,
+          previous: {
+            promo_orders: before ? (before[0]?.orders ?? 0) : null,
+            discount_amount: before ? (before[0]?.discount_amount ?? 0) : null,
+            promo_net_sales: before ? (before[0]?.net_sales ?? 0) : null,
+          },
+          ...(periods && { over_time: periods }),
+          group_by: groupBy,
+          // `code` too: dashboards made before group_by read rows.code.
+          rows: groupBy === "code" ? rows.map((row) => ({ ...row, code: row.name })) : rows,
         };
       });
     },
   ),
+};
+
+const NAMED = new Set(["name", "scope", "group", "category", "channel"]);
+
+/**
+ * A result with its rows' names as a reader sees them: "paid_search" → "Paid search",
+ * "apparel" → "Apparel". Only inside lists: a result's own `scope` or `group_by` stays as asked.
+ */
+function display(value: unknown, listed = false): unknown {
+  if (Array.isArray(value)) return value.map((item) => display(item, true));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, field]) => [
+      key,
+      listed && NAMED.has(key) && typeof field === "string"
+        ? optionLabel(field)
+        : display(field, listed),
+    ]),
+  );
+}
+
+// Dashboards made before `range` look rows up by their raw names ("apparel"), so only a call
+// that passes `range` gets display names.
+export const salesTools = Object.fromEntries(
+  Object.entries(tools).map(([name, tool]) => [
+    name,
+    {
+      description: tool.description,
+      output: tool.output,
+      // Read from the tool each time, not copied: its choices follow the data (tool.ts).
+      get parameters() {
+        return tool.parameters;
+      },
+      execute: async (...call: Parameters<typeof tool.execute>) => {
+        const result = await tool.execute(...call);
+        return text((call[0] as Record<string, unknown> | undefined)?.range)
+          ? display(result)
+          : result;
+      },
+    },
+  ]),
+) as typeof tools;
+
+/**
+ * Arguments a call takes but can't follow, given its other arguments. Targets are set per region
+ * or per category, never for a category within a region, so a call by region can't be narrowed to
+ * a category, nor one by category to a region.
+ */
+export const ignoredArguments: Record<string, (args: Record<string, unknown>) => string[]> = {
+  get_targets_vs_actuals: ({ scope }) =>
+    scope === "region" ? ["category"] : scope === "category" ? ["region"] : [],
 };
