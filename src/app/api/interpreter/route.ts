@@ -10,6 +10,9 @@ export const runtime = "nodejs";
 // activity log.
 const MAX_BODY = 8_000;
 
+// Total budget for one Query() call, the data tools included.
+const TIMEOUT_MS = 120_000;
+
 // Runs a dashboard's Query() calls for the browser: a data tool by name, or a script the
 // dashboard was generated with, which OpenUI Cloud runs and which calls the same data tools.
 // The data stays on this server; only the dashboard's results reach the browser.
@@ -33,7 +36,7 @@ export async function POST(request: NextRequest) {
   try {
     // Your tools get the visitor, and generated scripts run only for the dashboard's owner.
     const result = await asVisitor(visitor, () =>
-      dashboards.interpreter.execute(body, { userId: visitor }, { signal: request.signal }),
+      dashboards.interpreter.execute(body, { userId: visitor }, { signal: request.signal, timeoutMs: TIMEOUT_MS }),
     );
     return Response.json({ result });
   } catch (error) {
