@@ -1289,8 +1289,6 @@ function initializeAsciify(
     attributes: true,
     attributeFilter: ["class", "style", "data-theme"],
   });
-  const schemeQuery = window.matchMedia("(prefers-color-scheme: dark)");
-  schemeQuery.addEventListener("change", onThemeShift);
 
   let outputRect = output.getBoundingClientRect();
   const refreshOutputRect = () => {
@@ -1428,7 +1426,6 @@ function initializeAsciify(
       intersection.disconnect();
       themeObserver.disconnect();
       contentObserver?.disconnect();
-      schemeQuery.removeEventListener("change", onThemeShift);
       motionQuery.removeEventListener("change", onMotionChange);
       listenTarget.removeEventListener("pointermove", onPointerMove);
       listenTarget.removeEventListener("pointerleave", onPointerLeave);
