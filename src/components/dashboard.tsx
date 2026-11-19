@@ -13,7 +13,6 @@ import {
   useEffect,
   useRef,
   useState,
-  useSyncExternalStore,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -197,7 +196,6 @@ export function DashboardCard({
 /** The open dashboard, full size beside the chat. No header: the dashboard carries its own
  * title, and its top-bar tab (or the chat card) closes it. */
 export function DashboardPanel({ edit = false, ...source }: DashboardSource & { edit?: boolean }) {
-  const mode = useColorScheme();
   const frame = useRef<HTMLDivElement>(null);
   // Pending passes neither `response` nor `id`: the renderer shows its Pending slot until the
   // card hands over the call's result.
@@ -206,9 +204,9 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
   // LiveArtifactRenderer streams the dashboard from OpenUI Cloud and runs its Query() calls
   // through /api/interpreter. `preview={false}` renders it in place, framed by our Chrome. Every
   // renderer of one dashboard shares a stream, and an edit's response tells it a newer version
-  // exists. The kit's components follow the system's light or dark mode.
+  // exists. The demo is light only.
   return (
-    <ThemeProvider mode={mode}>
+    <ThemeProvider mode="light">
       <LiveArtifactRenderer
         {...stream}
         library={library}
@@ -400,16 +398,3 @@ function DashboardError() {
   );
 }
 
-const darkQuery = "(prefers-color-scheme: dark)";
-
-function useColorScheme(): "light" | "dark" {
-  return useSyncExternalStore(
-    (onChange) => {
-      const media = window.matchMedia(darkQuery);
-      media.addEventListener("change", onChange);
-      return () => media.removeEventListener("change", onChange);
-    },
-    () => (window.matchMedia(darkQuery).matches ? "dark" : "light"),
-    () => "light",
-  );
-}

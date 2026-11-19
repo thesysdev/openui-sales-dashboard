@@ -137,12 +137,10 @@ export function ShaderBackdrop() {
     };
     frame = requestAnimationFrame(draw);
 
-    const scheme = window.matchMedia("(prefers-color-scheme: dark)");
     const onScheme = () => {
       readInk();
       if (still) frame = requestAnimationFrame(draw);
     };
-    scheme.addEventListener("change", onScheme);
     const themeObserver = new MutationObserver(onScheme);
     themeObserver.observe(document.documentElement, {
       attributes: true,
@@ -151,7 +149,6 @@ export function ShaderBackdrop() {
 
     return () => {
       cancelAnimationFrame(frame);
-      scheme.removeEventListener("change", onScheme);
       themeObserver.disconnect();
       observer.disconnect();
       gl.deleteBuffer(quad);
