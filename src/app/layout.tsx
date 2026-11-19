@@ -9,7 +9,9 @@ export const metadata: Metadata = {
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    // The demo is light only. OpenUI's stylesheet switches its tokens to dark with the OS setting
+    // unless <html> has data-openui-theme="light".
+    <html lang="en" data-openui-theme="light">
       <body>{children}</body>
     </html>
   );
