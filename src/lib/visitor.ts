@@ -6,11 +6,12 @@ import type { NextRequest } from "next/server";
 // belong to it, so visitors list, open and edit only their own. It separates visitors; it doesn't
 // prove who anyone is. Use the signed-in user's id instead when you add authentication.
 
-export const VISITOR_COOKIE = "northstar-visitor";
+export const VISITOR_COOKIE = "sales-dashboard-visitor";
 
-const PATTERN = /^northstar_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const PATTERN =
+  /^sales_dashboard_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export const newVisitorId = () => `northstar_${crypto.randomUUID()}`;
+export const newVisitorId = () => `sales_dashboard_${crypto.randomUUID()}`;
 
 export const isVisitorId = (value: string | undefined): value is string =>
   value !== undefined && PATTERN.test(value);
