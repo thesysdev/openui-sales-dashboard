@@ -213,16 +213,20 @@ function AgentView({ hidden, onShowData }: { hidden: boolean; onShowData: () => 
             // Keyed by the tab or card that opened it, so each opens a fresh panel that
             // slides in with the app's one easing.
             <div
-              key={`${open.key}:${open.rev ?? 0}`}
+              key={open.key}
               className="h-full animate-in fade-in slide-in-from-right-4 duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]"
             >
+              {/* A refresh bumps `rev`: the renderer remounts in place and runs its queries
+                  again, without the panel sliding in a second time. */}
               <DashboardPanel
+                key={open.rev ?? 0}
                 {...("id" in open
                   ? { id: open.id }
                   : "response" in open
                     ? { response: open.response }
                     : { pending: true })}
                 edit={open.edit}
+                buildKey={open.key}
               />
             </div>
           ) : emptyThread ? (
@@ -306,7 +310,7 @@ function PlaceholderGrid() {
       <Notch
         show={running}
         icon={<CircleNotch className="size-3 animate-spin motion-reduce:animate-none" />}
-        label="Starting…"
+        label="Thinking…"
       />
       <ShaderBackdrop />
     </div>

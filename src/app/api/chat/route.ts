@@ -17,6 +17,9 @@ import { asVisitor, noVisitor, readVisitorId } from "../../../lib/visitor";
 
 export const runtime = "nodejs";
 
+// The dashboard tools run the build inside this request; give it time to finish.
+export const maxDuration = 300;
+
 // The toolkit's server build: create_dashboard and edit_dashboard, with their `execute`.
 const dashboardTools = new AISDKToolkit({ toolkit });
 
@@ -122,9 +125,29 @@ function forVisitor(tools: ToolSet, visitor: string): ToolSet {
         if (++calls > 1) {
           throw new Error("One dashboard per message: ask the user to send the next request on its own.");
         }
-        return asVisitor(visitor, () => execute(input, options));
+        const result = asVisitor(visitor, () => execute(input, options));
+        // A streaming tool is a generator: its body runs as it's read, so each read is the visitor's too.
+        return isAsyncIterable(result) ? (readAsVisitor(visitor, result) as typeof result) : result;
       };
       return [name, { ...tool, execute: wrapped }];
     }),
   );
+}
+
+const isAsyncIterable = (value: unknown): value is AsyncIterable<unknown> =>
+  typeof value === "object" && value !== null && Symbol.asyncIterator in value;
+
+/** `messages`, each read inside asVisitor(): the tool's code between two yields runs for `visitor`. */
+async function* readAsVisitor<T>(visitor: string, messages: AsyncIterable<T>): AsyncGenerator<T> {
+  const reader = messages[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      const next = await asVisitor(visitor, () => reader.next());
+      if (next.done) return;
+      yield next.value;
+    }
+  } finally {
+    // Stopped early (the request ended): the tool's generator ends too.
+    await asVisitor(visitor, async () => reader.return?.());
+  }
 }
