@@ -68,8 +68,8 @@ card (the tool's render) ◄─────────── streamed with the 
 ```
 
 1. The chat sends the thread to `/api/chat`. That route streams a reply from OpenUI Gateway with two tools, `create_dashboard` and `edit_dashboard`.
-2. `create_dashboard` runs on the server and starts generating the dashboard in OpenUI Cloud. It returns as soon as the dashboard has an id.
-3. The tool's card appears in the chat and opens the dashboard in the centre pane. `LiveArtifactRenderer` then streams the dashboard as it's generated.
+2. `create_dashboard` runs on the server and calls `dashboards.create()` with `{ stream: true }`, so the dashboard shows while it's being built. The tool streams two results: "Started…" as soon as the dashboard has an id, and "Created…" or "Couldn't…" once it's saved or failed. The model reads the last one. The build runs inside the chat request until the dashboard is saved, so `/api/chat` sets `maxDuration = 300` to give it time to finish.
+3. The tool's card appears in the chat and opens the dashboard in the centre pane. Until the dashboard starts streaming, `LiveArtifactRenderer` says what the build is doing, such as "Reading your data". Then it streams the dashboard as it's generated.
 4. The dashboard loads its numbers with `Query()` calls. Each one goes to `/api/interpreter`, which runs the matching sales tool in `src/lib/data/sales.ts` against the database.
 5. For a change, the model calls `edit_dashboard` with the dashboard's id, and the notch shows "Updating your dashboard…" until the new version is in.
 

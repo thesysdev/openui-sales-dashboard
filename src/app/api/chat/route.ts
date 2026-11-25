@@ -17,6 +17,9 @@ import { asVisitor, noVisitor, readVisitorId } from "../../../lib/visitor";
 
 export const runtime = "nodejs";
 
+// The dashboard tools run the build inside this request; give it time to finish.
+export const maxDuration = 300;
+
 // The toolkit's server build: create_dashboard and edit_dashboard, with their `execute`.
 const dashboardTools = new AISDKToolkit({ toolkit });
 
@@ -122,9 +125,24 @@ function forVisitor(tools: ToolSet, visitor: string): ToolSet {
         if (++calls > 1) {
           throw new Error("One dashboard per message: ask the user to send the next request on its own.");
         }
-        return asVisitor(visitor, () => execute(input, options));
+        const result = asVisitor(visitor, () => execute(input, options));
+        // A streaming tool runs as the AI SDK reads it, after this returns: read it for the visitor too.
+        return isAsyncIterable(result) ? forVisitorStream(result, visitor) : result;
       };
       return [name, { ...tool, execute: wrapped }];
     }),
   );
+}
+
+const isAsyncIterable = (value: unknown): value is AsyncIterable<unknown> =>
+  typeof (value as AsyncIterable<unknown> | null)?.[Symbol.asyncIterator] === "function";
+
+/** Reads `stream` one result at a time, each inside asVisitor(). */
+async function* forVisitorStream<T>(stream: AsyncIterable<T>, visitor: string) {
+  const iterator = stream[Symbol.asyncIterator]();
+  while (true) {
+    const step = await asVisitor(visitor, () => iterator.next());
+    if (step.done) return;
+    yield step.value;
+  }
 }
