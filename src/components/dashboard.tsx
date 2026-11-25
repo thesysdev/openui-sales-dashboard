@@ -28,8 +28,10 @@ export type DashboardSource = { response: string } | { id: string } | { pending:
 
 /** The dashboard in the side panel: the card or list row that opened it, and what to render.
  * `edit` marks an edit_dashboard result, so the panel says it is updating, not building.
- * `rev` counts refreshes: bumping it remounts the panel, which runs its queries again. */
-type Open = DashboardSource & { key: string; edit?: boolean; rev?: number };
+ * `rev` counts refreshes: bumping it remounts the panel, which runs its queries again.
+ * `mount` is the panel an edit took over: it stays mounted, so the dashboard on screen stays
+ * until the new version is ready. */
+type Open = DashboardSource & { key: string; edit?: boolean; rev?: number; mount?: string };
 
 const OpenDashboard = createContext<{
   open: Open | null;
@@ -89,8 +91,10 @@ type DashboardToolProps = ToolCallMessagePartProps<
 
 /**
  * The card in the chat for a create_dashboard or edit_dashboard call. Its result is OpenUI
- * Cloud's response, which the panel passes to the renderer as is. A new dashboard or an edit
- * opens beside the chat as soon as the tool returns.
+ * Cloud's response, which the panel passes to the renderer as is. The tool streams two: the first
+ * as soon as the dashboard has an id, and the last one once it's saved or failed, which the open
+ * panel gets too. A new dashboard opens beside the chat as soon as the call starts, an edit with
+ * its first result.
  */
 export function DashboardCard({
   toolName,
@@ -98,9 +102,10 @@ export function DashboardCard({
   args,
   result,
   isError,
+  isPreliminary,
   status,
 }: DashboardToolProps) {
-  const { open, setOpen } = useOpenDashboard();
+  const { open, setOpen, openId } = useOpenDashboard();
   const isOpen = open?.key === toolCallId;
   const response = !isError && typeof result === "string" ? result : undefined;
   const edit = toolName === "edit_dashboard";
@@ -124,20 +129,31 @@ export function DashboardCard({
     if (!opened.current) {
       if (!response && (edit || !running)) return;
       opened.current = true;
-      setOpen(response ? { key: toolCallId, response, edit } : { key: toolCallId, pending: true });
+      // An edit of the dashboard on screen takes over its panel instead of opening a new one.
+      const mount =
+        edit && open && openId === args?.id ? { mount: open.mount ?? open.key, rev: open.rev } : {};
+      setOpen(
+        response ? { key: toolCallId, response, edit, ...mount } : { key: toolCallId, pending: true },
+      );
     } else if (waitingHere && (response || !running)) {
       // The call the panel waits on ended. Its result fills the same panel (same key, so no
       // remount); stopped or failed, the panel closes.
       setOpen(response ? { key: toolCallId, response } : null);
+    } else if (response && open && isOpen && "response" in open && open.response !== response) {
+      // The last result, once the dashboard is saved or failed, goes to the panel only while it
+      // shows this card's dashboard.
+      setOpen({ ...open, response });
     }
-  }, [response, running, edit, waitingHere, toolCallId, setOpen]);
+  }, [response, running, edit, waitingHere, isOpen, open, openId, args?.id, toolCallId, setOpen]);
 
   const title =
     args?.title ?? (toolName === "edit_dashboard" ? "Dashboard change" : "New dashboard");
   const [label, tone]: [string, Tone] = isError
     ? ["Couldn't start", "error"]
     : response
-      ? [toolName === "edit_dashboard" ? "Change started" : "Live", "live"]
+      ? isPreliminary
+        ? [toolName === "edit_dashboard" ? "Changing" : "Building", "busy"]
+        : [toolName === "edit_dashboard" ? "Changed" : "Ready", "live"]
       : [status?.type === "running" ? "Starting" : "Waiting", "busy"];
 
   return (
@@ -288,7 +304,7 @@ function DashboardNotch({
   const { id, isPending, isStreaming, isLoading } = useArtifactRenderer();
   // While the call that makes the dashboard runs, the Pending loader shows the status.
   const busy = isLoading && !isPending;
-  // The agent is calling edit_dashboard right now: the change hasn't come back yet, so the
+  // The agent is calling edit_dashboard right now: the change hasn't been saved yet, so the
   // dashboard on screen is the one being updated.
   const editing = useAuiState(
     (state) =>
@@ -297,7 +313,7 @@ function DashboardNotch({
         (part) =>
           part.type === "tool-call" &&
           part.toolName === "edit_dashboard" &&
-          part.result === undefined,
+          (part.result === undefined || part.isPreliminary === true),
       ) ??
         false),
   );
