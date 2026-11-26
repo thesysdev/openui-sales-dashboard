@@ -239,9 +239,11 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
         <LiveArtifactRenderer.Chrome>
           <div ref={frame} className="relative h-full w-full bg-background">
             <PanelReport />
-            <DashboardNotch frame={frame} edit={edit} />
+            <DashboardNotch frame={frame} />
             <LiveArtifactRenderer.Content className="relative h-full overflow-y-auto p-4 sm:p-6">
               <LiveArtifactRenderer.Pending />
+              {/* "Loading data…" at the bottom of the panel; a build's feed takes its place. */}
+              <LiveArtifactRenderer.Loading />
               <LiveArtifactRenderer.Error>
                 <DashboardError />
               </LiveArtifactRenderer.Error>
@@ -293,24 +295,19 @@ function StatusDot({ tone }: { tone: Tone }) {
 }
 
 /**
- * The panel's status notch. While the dashboard is generated or loads its data it shows
- * progress. When a dashboard generated in this session settles, it measures how many fewer
+ * The panel's status notch. While the agent's edit call waits for its build to start, it says the
+ * dashboard on screen is being updated; from then on the renderer's own pill covers building and
+ * data loading. When a dashboard generated in this session settles, it measures how many fewer
  * tokens its OpenUI Lang program took than the HTML it rendered to, shows that for a few
- * seconds, then slides away. Opening an existing dashboard just shows loading, then leaves.
+ * seconds, then slides away.
  */
-function DashboardNotch({
-  frame,
-  edit,
-}: {
-  frame: RefObject<HTMLDivElement | null>;
-  edit: boolean;
-}) {
+function DashboardNotch({ frame }: { frame: RefObject<HTMLDivElement | null> }) {
   const { id, isPending, isStreaming, isLoading } = useArtifactRenderer();
-  // While the call that makes the dashboard runs, the Pending loader shows the status.
-  const busy = isLoading && !isPending;
-  // The agent is calling edit_dashboard right now: the change hasn't been saved yet, so the
+  // Being generated or loading its data: the savings are measured once both are done.
+  const loading = isLoading && !isPending;
+  // The agent is calling edit_dashboard right now and its build hasn't started streaming: the
   // dashboard on screen is the one being updated.
-  const editing = useAuiState(
+  const editCall = useAuiState(
     (state) =>
       state.thread.isRunning &&
       (state.thread.messages.at(-1)?.content.some(
@@ -321,11 +318,9 @@ function DashboardNotch({
       ) ??
         false),
   );
+  const editing = editCall && !isStreaming;
   const generated = useRef(false);
   const [savings, setSavings] = useState<number | null>(null);
-  // True between the dashboard settling and its savings arriving, so the notch stays put
-  // instead of leaving and coming back.
-  const [measuring, setMeasuring] = useState(false);
 
   useEffect(() => {
     if (isStreaming) {
@@ -335,17 +330,13 @@ function DashboardNotch({
   }, [isStreaming]);
 
   useEffect(() => {
-    if (busy || !generated.current || !id) return;
+    if (loading || !generated.current || !id) return;
     let cancelled = false;
     let hide = 0;
-    setMeasuring(true);
     // Let the last data render settle before reading the DOM.
     const start = window.setTimeout(async () => {
       const root = frame.current?.querySelector(".openui-dashboard");
-      if (!root) {
-        setMeasuring(false);
-        return;
-      }
+      if (!root) return;
       // Chart internals are collapsed: hand-written HTML would draw charts with a library too.
       const copy = root.cloneNode(true) as HTMLElement;
       copy.querySelectorAll("svg").forEach((svg) => svg.replaceChildren());
@@ -356,15 +347,12 @@ function DashboardNotch({
           body: JSON.stringify({ id, html: copy.outerHTML }),
         });
         const result = (await response.json()) as { pct?: number };
-        if (cancelled) return;
-        setMeasuring(false);
-        if (!response.ok || !result.pct) return;
+        if (cancelled || !response.ok || !result.pct) return;
         generated.current = false;
         setSavings(result.pct);
         hide = window.setTimeout(() => setSavings(null), 4000);
       } catch {
         // The savings note is a nicety; a failed measurement just skips it.
-        if (!cancelled) setMeasuring(false);
       }
     }, 600);
     return () => {
@@ -372,25 +360,19 @@ function DashboardNotch({
       window.clearTimeout(start);
       window.clearTimeout(hide);
     };
-  }, [busy, id, frame]);
+  }, [loading, id, frame]);
 
-  const working = editing || busy || measuring;
-  const label =
-    editing || (edit && busy)
-      ? "Updating your dashboard…"
-      : working
-        ? isStreaming
-          ? "Building your dashboard…"
-          : "Loading live data…"
-        : savings !== null
-          ? `${savings}% fewer tokens than HTML`
-          : "";
-  const icon = working ? (
+  const label = editing
+    ? "Updating your dashboard…"
+    : savings !== null
+      ? `${savings}% fewer tokens than HTML`
+      : "";
+  const icon = editing ? (
     <CircleNotchIcon className="size-3 animate-spin motion-reduce:animate-none" />
   ) : (
     <LightningIcon weight="fill" className="size-3" />
   );
-  return <Notch show={working || savings !== null} icon={icon} label={label} />;
+  return <Notch show={editing || savings !== null} icon={icon} label={label} />;
 }
 
 /** Above the dashboard when it fails. The slot shows it only then. */
