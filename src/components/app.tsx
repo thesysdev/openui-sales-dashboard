@@ -15,7 +15,7 @@ import {
   type ThreadMessage,
 } from "@assistant-ui/react";
 import { OpenUICloudProvider, useArtifactList } from "@openuidev/react-ui/cloud";
-import { ChatCircle, CircleNotch, SidebarSimple, X } from "@phosphor-icons/react";
+import { ChatCircleIcon, CircleNotchIcon, SidebarSimpleIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useRef, useState } from "react";
 import { withBase } from "../lib/base-path";
 import toolkit from "../lib/toolkit";
@@ -170,7 +170,7 @@ function Shell() {
             title="Close"
             className="absolute top-12 right-12 flex size-9 translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-primary text-primary-foreground transition-transform duration-150 hover:scale-105 animate-in fade-in duration-200"
           >
-            <X className="size-4" />
+            <XIcon className="size-4" />
           </button>
         </div>
       )}
@@ -211,9 +211,9 @@ function AgentView({ hidden, onShowData }: { hidden: boolean; onShowData: () => 
         <div className="min-h-0 flex-1 overflow-hidden">
           {open ? (
             // Keyed by the tab or card that opened it, so each opens a fresh panel that
-            // slides in with the app's one easing.
+            // slides in with the app's one easing. An edit keeps the panel it took over.
             <div
-              key={`${open.key}:${open.rev ?? 0}`}
+              key={`${open.mount ?? open.key}:${open.rev ?? 0}`}
               className="h-full animate-in fade-in slide-in-from-right-4 duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]"
             >
               <DashboardPanel
@@ -250,7 +250,7 @@ function AgentView({ hidden, onShowData }: { hidden: boolean; onShowData: () => 
             title="Collapse conversation"
             className="absolute top-2 left-3 z-10 flex size-7 items-center justify-center rounded-md border text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.03] hover:text-foreground"
           >
-            <SidebarSimple className="size-4 -scale-x-100" />
+            <SidebarSimpleIcon className="size-4 -scale-x-100" />
           </button>
           <div className="min-h-0 flex-1 pt-10">
             <Thread components={{ Welcome }} />
@@ -265,7 +265,7 @@ function AgentView({ hidden, onShowData }: { hidden: boolean; onShowData: () => 
           title="Open conversation"
           className="absolute top-2 right-3 z-20 flex h-7 items-center gap-1.5 rounded-md border bg-background px-2.5 text-sm text-muted-foreground transition-colors duration-150 animate-in fade-in duration-200 hover:bg-foreground/[0.03] hover:text-foreground"
         >
-          <ChatCircle className="size-3.5" />
+          <ChatCircleIcon className="size-3.5" />
           Edit with chat
         </button>
       )}
@@ -305,7 +305,7 @@ function PlaceholderGrid() {
     <div className="relative h-full bg-background">
       <Notch
         show={running}
-        icon={<CircleNotch className="size-3 animate-spin motion-reduce:animate-none" />}
+        icon={<CircleNotchIcon className="size-3 animate-spin motion-reduce:animate-none" />}
         label="Starting…"
       />
       <ShaderBackdrop />

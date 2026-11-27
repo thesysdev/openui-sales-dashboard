@@ -5,7 +5,13 @@ import { cn } from "@/lib/utils";
 import { useAuiState, type ToolCallMessagePartProps } from "@assistant-ui/react";
 import { ThemeProvider } from "@openuidev/dashboard-library";
 import { LiveArtifactRenderer, useArtifactRenderer } from "@openuidev/react-ui/cloud";
-import { ArrowClockwise, ArrowRight, CircleNotch, Lightning, Warning } from "@phosphor-icons/react";
+import {
+  ArrowClockwiseIcon,
+  ArrowRightIcon,
+  CircleNotchIcon,
+  LightningIcon,
+  WarningIcon,
+} from "@phosphor-icons/react";
 import {
   createContext,
   useCallback,
@@ -27,8 +33,10 @@ export type DashboardSource = { response: string } | { id: string } | { pending:
 
 /** The dashboard in the side panel: the card or list row that opened it, and what to render.
  * `edit` marks an edit_dashboard result, so the panel says it is updating, not building.
- * `rev` counts refreshes: bumping it remounts the panel, which runs its queries again. */
-type Open = DashboardSource & { key: string; edit?: boolean; rev?: number };
+ * `rev` counts refreshes: bumping it remounts the panel, which runs its queries again.
+ * `mount` is the panel an edit took over: it stays mounted, so the dashboard on screen stays
+ * until the new version is ready. */
+type Open = DashboardSource & { key: string; edit?: boolean; rev?: number; mount?: string };
 
 const OpenDashboard = createContext<{
   open: Open | null;
@@ -88,8 +96,10 @@ type DashboardToolProps = ToolCallMessagePartProps<
 
 /**
  * The card in the chat for a create_dashboard or edit_dashboard call. Its result is OpenUI
- * Cloud's response, which the panel passes to the renderer as is. A new dashboard or an edit
- * opens beside the chat as soon as the tool returns.
+ * Cloud's response, which the panel passes to the renderer as is. The tool streams two: the first
+ * as soon as the dashboard has an id, and the last one once it's saved or failed, which the open
+ * panel gets too. A new dashboard opens beside the chat as soon as the call starts, an edit with
+ * its first result.
  */
 export function DashboardCard({
   toolName,
@@ -97,9 +107,10 @@ export function DashboardCard({
   args,
   result,
   isError,
+  isPreliminary,
   status,
 }: DashboardToolProps) {
-  const { open, setOpen } = useOpenDashboard();
+  const { open, setOpen, openId } = useOpenDashboard();
   const isOpen = open?.key === toolCallId;
   const response = !isError && typeof result === "string" ? result : undefined;
   const edit = toolName === "edit_dashboard";
@@ -123,20 +134,31 @@ export function DashboardCard({
     if (!opened.current) {
       if (!response && (edit || !running)) return;
       opened.current = true;
-      setOpen(response ? { key: toolCallId, response, edit } : { key: toolCallId, pending: true });
+      // An edit of the dashboard on screen takes over its panel instead of opening a new one.
+      const mount =
+        edit && open && openId === args?.id ? { mount: open.mount ?? open.key, rev: open.rev } : {};
+      setOpen(
+        response ? { key: toolCallId, response, edit, ...mount } : { key: toolCallId, pending: true },
+      );
     } else if (waitingHere && (response || !running)) {
       // The call the panel waits on ended. Its result fills the same panel (same key, so no
       // remount); stopped or failed, the panel closes.
       setOpen(response ? { key: toolCallId, response } : null);
+    } else if (response && open && isOpen && "response" in open && open.response !== response) {
+      // The last result, once the dashboard is saved or failed, goes to the panel only while it
+      // shows this card's dashboard.
+      setOpen({ ...open, response });
     }
-  }, [response, running, edit, waitingHere, toolCallId, setOpen]);
+  }, [response, running, edit, waitingHere, isOpen, open, openId, args?.id, toolCallId, setOpen]);
 
   const title =
     args?.title ?? (toolName === "edit_dashboard" ? "Dashboard change" : "New dashboard");
   const [label, tone]: [string, Tone] = isError
     ? ["Couldn't start", "error"]
     : response
-      ? [toolName === "edit_dashboard" ? "Change started" : "Live", "live"]
+      ? isPreliminary
+        ? [toolName === "edit_dashboard" ? "Changing" : "Building", "busy"]
+        : [toolName === "edit_dashboard" ? "Changed" : "Ready", "live"]
       : [status?.type === "running" ? "Starting" : "Waiting", "busy"];
 
   return (
@@ -179,14 +201,14 @@ export function DashboardCard({
             title="Refresh dashboard"
             className="absolute top-1/2 right-3 flex size-7 -translate-y-1/2 items-center justify-center rounded-full bg-foreground/[0.05] text-muted-foreground transition-colors duration-150 hover:bg-foreground/[0.08] hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
           >
-            <ArrowClockwise className="size-3.5" />
+            <ArrowClockwiseIcon className="size-3.5" />
           </button>
         ) : (
           <span
             aria-hidden
             className="pointer-events-none absolute top-1/2 right-3 flex size-7 -translate-y-1/2 items-center justify-center rounded-full bg-foreground/[0.05] text-muted-foreground transition-colors duration-150 group-hover:text-foreground"
           >
-            <ArrowRight className="size-3.5" />
+            <ArrowRightIcon className="size-3.5" />
           </span>
         ))}
     </div>
@@ -217,9 +239,11 @@ export function DashboardPanel({ edit = false, ...source }: DashboardSource & { 
         <LiveArtifactRenderer.Chrome>
           <div ref={frame} className="relative h-full w-full bg-background">
             <PanelReport />
-            <DashboardNotch frame={frame} edit={edit} />
+            <DashboardNotch frame={frame} />
             <LiveArtifactRenderer.Content className="relative h-full overflow-y-auto p-4 sm:p-6">
               <LiveArtifactRenderer.Pending />
+              {/* "Loading data…" at the bottom of the panel; a build's feed takes its place. */}
+              <LiveArtifactRenderer.Loading />
               <LiveArtifactRenderer.Error>
                 <DashboardError />
               </LiveArtifactRenderer.Error>
@@ -271,39 +295,32 @@ function StatusDot({ tone }: { tone: Tone }) {
 }
 
 /**
- * The panel's status notch. While the dashboard is generated or loads its data it shows
- * progress. When a dashboard generated in this session settles, it measures how many fewer
+ * The panel's status notch. While the agent's edit call waits for its build to start, it says the
+ * dashboard on screen is being updated; from then on the renderer's own pill covers building and
+ * data loading. When a dashboard generated in this session settles, it measures how many fewer
  * tokens its OpenUI Lang program took than the HTML it rendered to, shows that for a few
- * seconds, then slides away. Opening an existing dashboard just shows loading, then leaves.
+ * seconds, then slides away.
  */
-function DashboardNotch({
-  frame,
-  edit,
-}: {
-  frame: RefObject<HTMLDivElement | null>;
-  edit: boolean;
-}) {
+function DashboardNotch({ frame }: { frame: RefObject<HTMLDivElement | null> }) {
   const { id, isPending, isStreaming, isLoading } = useArtifactRenderer();
-  // While the call that makes the dashboard runs, the Pending loader shows the status.
-  const busy = isLoading && !isPending;
-  // The agent is calling edit_dashboard right now: the change hasn't come back yet, so the
+  // Being generated or loading its data: the savings are measured once both are done.
+  const loading = isLoading && !isPending;
+  // The agent is calling edit_dashboard right now and its build hasn't started streaming: the
   // dashboard on screen is the one being updated.
-  const editing = useAuiState(
+  const editCall = useAuiState(
     (state) =>
       state.thread.isRunning &&
       (state.thread.messages.at(-1)?.content.some(
         (part) =>
           part.type === "tool-call" &&
           part.toolName === "edit_dashboard" &&
-          part.result === undefined,
+          (part.result === undefined || part.isPreliminary === true),
       ) ??
         false),
   );
+  const editing = editCall && !isStreaming;
   const generated = useRef(false);
   const [savings, setSavings] = useState<number | null>(null);
-  // True between the dashboard settling and its savings arriving, so the notch stays put
-  // instead of leaving and coming back.
-  const [measuring, setMeasuring] = useState(false);
 
   useEffect(() => {
     if (isStreaming) {
@@ -313,17 +330,13 @@ function DashboardNotch({
   }, [isStreaming]);
 
   useEffect(() => {
-    if (busy || !generated.current || !id) return;
+    if (loading || !generated.current || !id) return;
     let cancelled = false;
     let hide = 0;
-    setMeasuring(true);
     // Let the last data render settle before reading the DOM.
     const start = window.setTimeout(async () => {
       const root = frame.current?.querySelector(".openui-dashboard");
-      if (!root) {
-        setMeasuring(false);
-        return;
-      }
+      if (!root) return;
       // Chart internals are collapsed: hand-written HTML would draw charts with a library too.
       const copy = root.cloneNode(true) as HTMLElement;
       copy.querySelectorAll("svg").forEach((svg) => svg.replaceChildren());
@@ -334,15 +347,12 @@ function DashboardNotch({
           body: JSON.stringify({ id, html: copy.outerHTML }),
         });
         const result = (await response.json()) as { pct?: number };
-        if (cancelled) return;
-        setMeasuring(false);
-        if (!response.ok || !result.pct) return;
+        if (cancelled || !response.ok || !result.pct) return;
         generated.current = false;
         setSavings(result.pct);
         hide = window.setTimeout(() => setSavings(null), 4000);
       } catch {
         // The savings note is a nicety; a failed measurement just skips it.
-        if (!cancelled) setMeasuring(false);
       }
     }, 600);
     return () => {
@@ -350,25 +360,19 @@ function DashboardNotch({
       window.clearTimeout(start);
       window.clearTimeout(hide);
     };
-  }, [busy, id, frame]);
+  }, [loading, id, frame]);
 
-  const working = editing || busy || measuring;
-  const label =
-    editing || (edit && busy)
-      ? "Updating your dashboard…"
-      : working
-        ? isStreaming
-          ? "Building your dashboard…"
-          : "Loading live data…"
-        : savings !== null
-          ? `${savings}% fewer tokens than HTML`
-          : "";
-  const icon = working ? (
-    <CircleNotch className="size-3 animate-spin motion-reduce:animate-none" />
+  const label = editing
+    ? "Updating your dashboard…"
+    : savings !== null
+      ? `${savings}% fewer tokens than HTML`
+      : "";
+  const icon = editing ? (
+    <CircleNotchIcon className="size-3 animate-spin motion-reduce:animate-none" />
   ) : (
-    <Lightning weight="fill" className="size-3" />
+    <LightningIcon weight="fill" className="size-3" />
   );
-  return <Notch show={working || savings !== null} icon={icon} label={label} />;
+  return <Notch show={editing || savings !== null} icon={icon} label={label} />;
 }
 
 /** Above the dashboard when it fails. The slot shows it only then. */
@@ -379,7 +383,7 @@ function DashboardError() {
       role="alert"
       className="mb-4 flex items-start gap-3 rounded-xl border border-destructive/30 bg-destructive/5 p-4 text-sm"
     >
-      <Warning className="mt-0.5 size-4 shrink-0 text-destructive" />
+      <WarningIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
       <div className="min-w-0 flex-1">
         <p className="font-medium">
           {error?.source === "query"
@@ -390,7 +394,7 @@ function DashboardError() {
       </div>
       {retry && (
         <Button variant="outline" size="sm" onClick={retry}>
-          <ArrowClockwise />
+          <ArrowClockwiseIcon />
           Try again
         </Button>
       )}
